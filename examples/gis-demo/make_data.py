@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Convert the Natural Earth `data/global.geo.json` into a second open format.
+"""Convert the demo `data/global.geo.json` into a second open format.
 
 The source of truth is `payload/data/global.geo.json` (GeoJSON / RFC 7946,
-177 Admin-0 countries, Polygon + MultiPolygon). This script converts it to a
-length-prefixed WKB stream (`payload/data/global.wkb`) so the demo ships the
-*same* dataset in two open formats.
+Admin-0 country boundaries + a compliant China boundary, Polygon /
+MultiPolygon / LineString). This script converts it to a length-prefixed WKB
+stream (`payload/data/global.wkb`) so the demo ships the *same* dataset in two
+open formats.
 
 The WASM component reads *both* through the same payload-fs ABI and parses
 each format internally — the browser never sees the format.
@@ -16,6 +17,12 @@ import os
 
 GEOJSON = "global.geo.json"
 WKB_OUT = "global.wkb"
+
+# China boundary provenance: the `China` feature (and the nine-dash line
+# features) are sourced from Alibaba Cloud DataV.GeoAtlas
+# (https://geo.datav.aliyun.com/areas_v3/bound/100000*.json), which represents
+# Taiwan / 藏南 / 阿克赛钦 / 南海诸岛 consistently with the official Chinese
+# standard map. The remaining countries are Natural Earth Admin-0 boundaries.
 
 
 def geojson_kind(gtype):

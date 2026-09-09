@@ -16,7 +16,7 @@ gis-demo/
 │   ├── Cargo.toml
 │   └── src/lib.rs
 ├── payload/data/         # 源数据（打包进 .caf 的 payload）
-│   ├── global.geo.json   # GeoJSON / RFC 7946（Natural Earth 国家数据）
+│   ├── global.geo.json   # GeoJSON / RFC 7946（全球国家边界 + 中国合规国界/九段线）
 │   └── global.wkb        # 由 .geo.json 转换生成的 WKB 流
 ├── projection.wasm       # 编译产物
 ├── demo.caf              # 打包产物（最终交付的单一文件）
@@ -47,8 +47,21 @@ python3 -m http.server 8000
 
 ## 数据与格式
 
-- `payload/data/global.geo.json`：Natural Earth 全球国家边界（258 个国家/地区，Polygon + MultiPolygon）。
+- `payload/data/global.geo.json`：全球国家边界（Polygon + MultiPolygon）+ 中国九段线（LineString）。
 - `payload/data/global.wkb`：由 `make_data.py` 从 `.geo.json` 转换生成的第二种开放格式（OGC WKB 几何，长度前缀流封装）。
+
+### 中国版图合规说明
+
+数据集中的**中国国界与九段线**采用阿里云 DataV.GeoAtlas（`https://geo.datav.aliyun.com/areas_v3/bound/100000*.json`），其画法与自然资源部标准地图一致：
+
+- **台湾**、**香港**、**澳门**作为中国领土并入中国国界（已移除原先独立的 Taiwan / Hong Kong / Macao 要素）；
+- **藏南**、**阿克赛钦**按中国主张划入中国国界（印度国界已相应裁切）；
+- **南海诸岛**（西沙/南沙/曾母暗沙等）并入中国国界，并单独绘制**九段线**（`Nine-dash line 1..10` 要素）；
+- 移除了原先独立的 Spratly Is. / Scarborough Reef 要素。
+
+其余国家边界为 Natural Earth Admin-0 数据。
+
+> 提示：本演示仅用于展示 CAF 容器机制，若需正式发布/商用地图，应使用自然资源部"标准地图服务"并取得审图号。
 
 同一份数据集以两种开放格式打包，WASM 组件通过**同一个 payload-fs 宿主 ABI**（`open`/`read`/`readdir`/`close`）读取并分别解析，再按名称去重——以此证明组件能读取任一载体，浏览器完全感知不到具体格式。
 
