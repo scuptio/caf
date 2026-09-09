@@ -167,6 +167,42 @@ fn load_features() -> Result<Vec<Feature>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Capability: features_from_file(name) — read ONE payload file by name and
+// decode it with the decoder selected by the filename (`*.wkb` -> WKB parser,
+// anything else -> GeoJSON parser). This makes format dispatch explicit at the
+// capability boundary: the caller picks a file, the component picks the codec.
+// ---------------------------------------------------------------------------
+#[unsafe(no_mangle)]
+pub extern "C" fn features_from_file(name_ptr: u32, name_len: u32) -> u64 {
+    let result = match load_features_from_file(name_ptr, name_len) {
+        Ok(features) => {
+            let list = FeatureList {
+                crs: "EPSG:4326".to_string(),
+                features,
+            };
+            serde_json::to_string(&list).unwrap_or_else(|e| error_json(e.to_string()))
+        }
+        Err(e) => error_json(e),
+    };
+    pack_result(result)
+}
+
+fn load_features_from_file(name_ptr: u32, name_len: u32) -> Result<Vec<Feature>, String> {
+    let name = unsafe {
+        let slice = std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
+        std::str::from_utf8(slice).map_err(|e| e.to_string())?.to_string()
+    };
+    let path = format!("/data/{name}");
+    let bytes = read_file(&path)?;
+    let parsed = if name.ends_with(".wkb") {
+        parse_wkb_impl(&bytes)?
+    } else {
+        parse_geojson_impl(&bytes)?
+    };
+    Ok(parsed.features)
+}
+
+// ---------------------------------------------------------------------------
 // GeoJSON parser.
 // ---------------------------------------------------------------------------
 fn parse_geojson_impl(bytes: &[u8]) -> Result<FeatureList, String> {

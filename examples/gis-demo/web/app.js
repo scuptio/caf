@@ -17,6 +17,7 @@ const state = {
   features: [],
   projection: 3857,
   layer: "all",
+  format: "global.geo.json",
   view: { scale: 1, tx: 0, ty: 0 },
   bounds: null,
   dirty: true,
@@ -34,7 +35,7 @@ async function loadBuffer(arrayBuffer) {
     const caf = CAF.parseCaf(arrayBuffer);
     const comp = await CAF.instantiate(caf.wasm, caf.files, arrayBuffer);
 
-    const result = comp.features();
+    const result = comp.featuresFromFile(state.format);
     if (result.error) throw new Error(result.error);
 
     state.caf = caf;
@@ -46,7 +47,7 @@ async function loadBuffer(arrayBuffer) {
     fitView();
     render();
     $("status").textContent =
-      "Loaded " + caf.manifest.name + " — " + state.features.length + " features";
+      "Loaded " + state.format + " — " + state.features.length + " features";
     $("dropHint").classList.add("hidden");
   } catch (err) {
     $("status").textContent = "Error: " + err.message;
@@ -87,7 +88,7 @@ function updateInfo(caf, comp, files) {
 
   $("exportsInfo").innerHTML = comp
     .exports()
-    .filter((n) => ["features", "reproject_x", "reproject_y", "alloc", "dealloc"].includes(n))
+    .filter((n) => ["features", "features_from_file", "reproject_x", "reproject_y", "alloc", "dealloc"].includes(n))
     .map((n) => `<span class="badge">${n}()</span>`)
     .join("");
 }
@@ -331,6 +332,31 @@ $("layerSelect").addEventListener("change", (e) => {
   state.layer = e.target.value;
   render();
 });
+
+// Payload format: pick exactly one carrier file; the WASM component decodes it
+// with the codec matched by filename (*.wkb -> WKB, else GeoJSON).
+function chooseFormat(name) {
+  state.format = name;
+  $("fmtGeojson").checked = name === "global.geo.json";
+  $("fmtWkb").checked = name === "global.wkb";
+  if (state.comp) reloadFeatures();
+}
+
+function reloadFeatures() {
+  const result = state.comp.featuresFromFile(state.format);
+  if (result.error) {
+    $("status").textContent = "Error: " + result.error;
+    return;
+  }
+  state.features = result.features;
+  fitView();
+  render();
+  $("status").textContent =
+    "Loaded " + state.format + " — " + state.features.length + " features";
+}
+
+$("fmtGeojson").addEventListener("change", () => chooseFormat("global.geo.json"));
+$("fmtWkb").addEventListener("change", () => chooseFormat("global.wkb"));
 
 $("toggleBtn").addEventListener("click", () => {
   $("panel").classList.toggle("collapsed");

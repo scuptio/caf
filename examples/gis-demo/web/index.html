@@ -73,6 +73,8 @@
   }
   .field { margin-bottom: 10px; }
   .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field label.checkbox { display: flex; align-items: center; gap: 6px; color: var(--fg); cursor: pointer; }
+  .field label.checkbox input { cursor: pointer; }
   .field select { width: 100%; }
   .info-list { font-size: 12px; color: var(--muted); }
   .info-list .row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid var(--border); }
@@ -137,6 +139,20 @@
             <option value="Antarctica">Antarctica</option>
             <option value="Seven seas (open ocean)">Seven seas</option>
           </select>
+        </div>
+      </div>
+
+      <div class="group">
+        <h3>Payload format</h3>
+        <div class="field">
+          <label class="checkbox">
+            <input type="checkbox" id="fmtGeojson" checked />
+            global.geo.json (GeoJSON)
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="fmtWkb" />
+            global.wkb (WKB)
+          </label>
         </div>
       </div>
 

@@ -239,9 +239,24 @@
       return JSON.parse(text);
     }
 
+    function featuresFromFile(name) {
+      const nameBytes = utf8Encode(name);
+      const namePtr = instance.exports.alloc(nameBytes.length);
+      memory8().set(nameBytes, namePtr);
+      const res = instance.exports.features_from_file(namePtr, nameBytes.length); // BigInt
+      const ptr = Number(res & 0xffffffffn);
+      const len = Number((res >> 32n) & 0xffffffffn);
+      const bytes = memory8().slice(ptr, ptr + len);
+      const text = utf8Decode(bytes);
+      instance.exports.dealloc(ptr, len);
+      instance.exports.dealloc(namePtr, nameBytes.length);
+      return JSON.parse(text);
+    }
+
     return {
       instance,
       features: callFeatures,
+      featuresFromFile,
       reproject: (x, y, from, to) => [
         instance.exports.reproject_x(x, y, from, to),
         instance.exports.reproject_y(x, y, from, to),
