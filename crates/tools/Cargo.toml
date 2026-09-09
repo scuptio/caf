@@ -1,0 +1,21 @@
+[package]
+name = "caf-tool"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Build tool for the CAF (Computable Artifact Format) container."
+
+[[bin]]
+name = "caf-tool"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }

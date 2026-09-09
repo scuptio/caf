@@ -1,0 +1,15 @@
+name = "global-countries"
+version = "0.1.0"
+
+interfaces = ["interfaces/gis.wit"]
+
+[payload]
+root = "payload"
+media_type = "application/x-spatial-demo"
+
+[[components]]
+name = "projection"
+world = "projection"
+path = "projection.wasm"
+capabilities = ["cf:spatial-transform@1"]
+access = []

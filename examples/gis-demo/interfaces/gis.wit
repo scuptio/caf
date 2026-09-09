@@ -1,0 +1,14 @@
+package cf:gis@0.1.0;
+
+interface spatial-transform {
+  record point {
+    x: f64,
+    y: f64,
+  }
+
+  reproject: func(x: f64, y: f64, from: u32, to: u32) -> point;
+}
+
+world projection {
+  export spatial-transform;
+}
