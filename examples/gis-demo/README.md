@@ -50,6 +50,8 @@ python3 -m http.server 8000
 - `payload/data/global.geo.json`：全球国家边界（Polygon + MultiPolygon）+ 中国九段线（LineString）。
 - `payload/data/global.wkb`：由 `make_data.py` 从 `.geo.json` 转换生成的第二种开放格式（OGC WKB 几何，长度前缀流封装）。
 
+> 坐标为 5 位小数（约 1 米精度，远高于 Web 地图渲染需求），以降低体积与移动端内存占用。
+
 ### 中国版图合规说明
 
 数据集中的**中国国界与九段线**采用阿里云 DataV.GeoAtlas（`https://geo.datav.aliyun.com/areas_v3/bound/100000*.json`），其画法与自然资源部标准地图一致：
