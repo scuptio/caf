@@ -2,7 +2,7 @@
 
 A Rust workspace implementing the **Computable Artifact Format (`.caf`)** — a
 general, domain-agnostic way to ship *data together with the computation that
-operates on it*, from [`doc/todo/computable_file.md`](doc/todo/computable_file.md).
+operates on it*.
 
 > **Stop shipping data. Ship capabilities.**
 
@@ -47,14 +47,13 @@ expressed entirely through (a) its WIT interface, (b) its WASM components, and
 ## Workspace layout
 
 ```
-faas/
+caf/
 ├── crates/
 │   └── tools/        # caf-tool: build/inspect .caf artifacts
 ├── examples/
 │   └── gis-demo/     # a worked example profile (browser demo, no backend)
 └── doc/
-    ├── spec/         # container format & ABI specifications
-    └── todo/         # design notes / drafts
+    └── spec/         # container format & ABI specifications
 ```
 
 ## Quick start
@@ -66,6 +65,12 @@ cargo build --workspace
 # Pack a payload directory + interface + WASM components into a .caf artifact
 cargo run -p caf-tool -- build -c build.toml -o artifact.caf \
     --dump-manifest artifact.manifest.json
+
+# Verify a .caf artifact (hash chain, access scopes, signature)
+cargo run -p caf-tool -- verify artifact.caf
+
+# Print a human-readable summary (or full JSON with --json)
+cargo run -p caf-tool -- inspect artifact.caf
 ```
 
 `caf-tool` compiles the `build.toml` configuration (artifact identity, WIT
@@ -80,7 +85,5 @@ a WASM component, and a payload in multiple open formats — see
 
 - [`doc/spec/container-format.md`](doc/spec/container-format.md) — the `.caf`
   container format (byte layout, manifest, components, payload, verification).
-- [`doc/spec/gis-profile.md`](doc/spec/gis-profile.md) — an example profile
+- [`examples/gis-demo/gis-profile.md`](examples/gis-demo/gis-profile.md) — an example profile
   layered on top of the generic container.
-- [`doc/todo/computable_file.md`](doc/todo/computable_file.md) — design draft of
-  the general "computable file" concept.

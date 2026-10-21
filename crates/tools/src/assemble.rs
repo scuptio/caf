@@ -1,15 +1,16 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::exports;
 use crate::hex;
-use crate::layout::{self, Layout, FLAG_SIGNED};
+use crate::layout::{
+    self, DirectoryEntry, FLAG_SIGNED, TAG_COMPONENT, TAG_MANIFEST, TAG_PAYLOAD, TAG_SIGNATURE,
+};
 use crate::manifest::*;
 use crate::payload;
-
-const LAYOUT_MAX_ITERS: usize = 16;
 
 pub struct BuildOutput {
     pub bytes: Vec<u8>,
@@ -17,32 +18,30 @@ pub struct BuildOutput {
 }
 
 pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
+    // 1. Interface (WIT text) and its hash.
     let interface_bytes = load_interface(cfg, base)?;
     let interface_hash = sha256_hex(&interface_bytes);
 
+    // 2. WASM component blobs, hashes, and extracted exports.
     let (wasm_blobs, wasm_hashes) = load_components(cfg, base)?;
 
+    // 3. Payload tree (chunked Merkle hashing).
     let payload_root = payload::build_tree(&base.join(&cfg.payload.root))?;
     let payload_root_hash = payload_root.hash.clone();
 
+    // 4. Component refs: access scopes (path + content hash) and exports.
     let components = build_components(cfg, &payload_root, &wasm_hashes, &wasm_blobs)?;
 
-    let mut capabilities = cfg.capabilities.clone();
-    for c in &cfg.components {
-        for cap in &c.capabilities {
-            if !capabilities.contains(cap) {
-                capabilities.push(cap.clone());
-            }
-        }
-    }
+    // 5. Capabilities (parsed and deduplicated).
+    let capabilities = collect_capabilities(cfg)?;
 
-    let mut manifest = Manifest {
+    // 6. Manifest — no absolute offsets (those live in the directory).
+    let manifest = Manifest {
         name: cfg.name.clone(),
         version: cfg.version.clone(),
         format_version: cfg.format_version,
         interface: InterfaceRef {
             inline: false,
-            offset: 0,
             length: interface_bytes.len() as u64,
             hash: interface_hash.clone(),
         },
@@ -75,7 +74,6 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
         payloads: vec![PayloadRef {
             root: payload_root,
             media_type: cfg.payload.media_type.clone(),
-            offset: 0,
             length: 0,
             hash: payload_root_hash.clone(),
             compressed: None,
@@ -84,52 +82,76 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
             interface: interface_hash.clone(),
             wasm: wasm_hashes.clone(),
             payload: vec![payload_root_hash.clone()],
-            manifest: ZERO_HASH.to_string(),
-            root: ZERO_HASH.to_string(),
         },
     };
 
-    let directory = build_directory(&manifest);
-    let directory_bytes = cbor_bytes(&directory)?;
-
-    let component_lens: Vec<u64> = wasm_blobs.iter().map(|b| b.len() as u64).collect();
-    let mut file_lens = Vec::new();
-    payload::collect_file_lengths(&manifest.payloads[0].root, &mut file_lens);
-
-    let signed = cfg.sign.is_some();
-    let layout = resolve_layout(
-        &mut manifest,
-        &component_lens,
-        &file_lens,
-        interface_bytes.len() as u64,
-        directory_bytes.len() as u64,
-        signed,
-    )?;
-
+    // 7. Manifest bytes and manifest hash (over the *final* manifest bytes).
     let manifest_bytes = cbor_bytes(&manifest)?;
     let manifest_hash = sha256_hex(&manifest_bytes);
 
-    let mut root_hasher = Sha256::new();
-    root_hasher.update(hex::decode(&manifest_hash)?);
-    root_hasher.update(hex::decode(&interface_hash)?);
-    for w in &wasm_hashes {
-        root_hasher.update(hex::decode(w)?);
+    // 8. Section inventory for layout + directory (deterministic DFS order).
+    let component_lens: Vec<u64> = wasm_blobs.iter().map(|b| b.len() as u64).collect();
+    let mut file_list: Vec<(String, String, u64)> = Vec::new();
+    payload::collect_files(&manifest.payloads[0].root, "", &mut file_list);
+    let file_lens: Vec<u64> = file_list.iter().map(|(_, _, len)| *len).collect();
+
+    let signed = cfg.sign.is_some();
+    let entry_count = 1 + component_lens.len() + file_lens.len() + usize::from(signed);
+    let directory_len = 4 + (entry_count * layout::DIRECTORY_ENTRY_SIZE) as u64;
+
+    // 9. Layout in a single pass (no self-referential offsets).
+    let layout = layout::compute(
+        manifest_bytes.len() as u64,
+        interface_bytes.len() as u64,
+        directory_len,
+        &component_lens,
+        &file_lens,
+        signed,
+    );
+
+    // 10. Directory (TOC): manifest, components, payload files, signature.
+    let mut entries: Vec<DirectoryEntry> = Vec::with_capacity(entry_count);
+    entries.push(DirectoryEntry {
+        tag: TAG_MANIFEST,
+        offset: layout.manifest_offset,
+        length: manifest_bytes.len() as u64,
+        hash: decode_hash(&manifest_hash)?,
+    });
+    for (i, blob) in wasm_blobs.iter().enumerate() {
+        entries.push(DirectoryEntry {
+            tag: TAG_COMPONENT,
+            offset: layout.component_offsets[i],
+            length: blob.len() as u64,
+            hash: decode_hash(&wasm_hashes[i])?,
+        });
     }
-    root_hasher.update(hex::decode(&payload_root_hash)?);
-    let digest = root_hasher.finalize();
-    let mut root_hash_raw = [0u8; 32];
-    root_hash_raw.copy_from_slice(&digest);
-    let root_hash = hex::encode(&root_hash_raw);
+    for (i, (_, hash, len)) in file_list.iter().enumerate() {
+        entries.push(DirectoryEntry {
+            tag: TAG_PAYLOAD,
+            offset: layout.file_offsets[i],
+            length: *len,
+            hash: decode_hash(hash)?,
+        });
+    }
+    if signed {
+        entries.push(DirectoryEntry {
+            tag: TAG_SIGNATURE,
+            offset: layout.signature_offset,
+            length: 96,
+            hash: [0u8; 32],
+        });
+    }
+    let directory_bytes = layout::encode_directory(&entries);
 
-    manifest.hashes.manifest = manifest_hash;
-    manifest.hashes.root = root_hash;
-    let final_manifest_bytes = cbor_bytes(&manifest)?;
+    // 11. Root hash = SHA256(ManifestHash || InterfaceHash || WasmHash* || PayloadHash*).
+    let root_hash = compute_root_hash(&manifest_hash, &interface_hash, &wasm_hashes, &payload_root_hash)?;
 
+    // 12. Write the file.
     let mut out = Vec::new();
     let flags = if signed { FLAG_SIGNED } else { 0 };
-    layout::write_header(&mut out, &layout, cfg.format_version, &root_hash_raw, flags);
+    layout::write_header(&mut out, &layout, cfg.format_version, &root_hash, flags);
     pad_to(&mut out, layout.manifest_offset);
-    out.extend_from_slice(&final_manifest_bytes);
+    out.extend_from_slice(&manifest_bytes);
     pad_to(&mut out, layout.interface_offset);
     out.extend_from_slice(&interface_bytes);
     pad_to(&mut out, layout.directory_offset);
@@ -140,15 +162,15 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
         out.extend_from_slice(blob);
     }
 
-    let mut blobs: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
     collect_payload_blobs(
         &manifest.payloads[0].root,
         &base.join(&cfg.payload.root),
         Path::new(""),
         &mut blobs,
     )?;
-    for (offset, data) in &blobs {
-        pad_to(&mut out, *offset);
+    for (i, data) in blobs.iter().enumerate() {
+        pad_to(&mut out, layout.file_offsets[i]);
         out.extend_from_slice(data);
     }
 
@@ -159,7 +181,7 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
             .as_ref()
             .map(|s| s.seed.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing sign.seed"))?;
-        let (pubkey, sig) = sign_manifest(seed, &final_manifest_bytes)?;
+        let (pubkey, sig) = sign_manifest(seed, &manifest_bytes)?;
         out.extend_from_slice(&pubkey);
         out.extend_from_slice(&sig);
     }
@@ -170,39 +192,39 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     })
 }
 
-fn resolve_layout(
-    manifest: &mut Manifest,
-    component_lens: &[u64],
-    file_lens: &[u64],
-    interface_len: u64,
-    directory_len: u64,
-    signed: bool,
-) -> Result<Layout> {
-    let mut len = 0u64;
-    for _ in 0..LAYOUT_MAX_ITERS {
-        let l = layout::compute(len, interface_len, directory_len, component_lens, file_lens, signed);
-        apply_layout(manifest, &l);
-        let new_len = cbor_bytes(manifest)?.len() as u64;
-        if new_len == len {
-            return Ok(l);
-        }
-        len = new_len;
+fn collect_capabilities(cfg: &Config) -> Result<Vec<CapabilityId>> {
+    let mut out: Vec<CapabilityId> = Vec::new();
+    for cap in &cfg.capabilities {
+        out.push(CapabilityId::parse(cap).map_err(anyhow::Error::msg)?);
     }
-    bail!("layout did not converge");
+    for c in &cfg.components {
+        for cap in &c.capabilities {
+            let parsed = CapabilityId::parse(cap).map_err(anyhow::Error::msg)?;
+            if !out.contains(&parsed) {
+                out.push(parsed);
+            }
+        }
+    }
+    Ok(out)
 }
 
-fn apply_layout(manifest: &mut Manifest, l: &Layout) {
-    manifest.interface.offset = l.interface_offset;
-    manifest.interface.length = l.interface_len;
-    for (i, c) in manifest.components.iter_mut().enumerate() {
-        c.offset = l.component_offsets[i];
+fn compute_root_hash(
+    manifest_hash: &str,
+    interface_hash: &str,
+    wasm_hashes: &[String],
+    payload_root_hash: &str,
+) -> Result<[u8; 32]> {
+    let mut h = Sha256::new();
+    h.update(hex::decode(manifest_hash)?);
+    h.update(hex::decode(interface_hash)?);
+    for w in wasm_hashes {
+        h.update(hex::decode(w)?);
     }
-    if let Some(p) = manifest.payloads.first_mut() {
-        p.offset = l.payload_offset;
-        p.length = l.payload_len;
-        let mut idx = 0usize;
-        payload::assign_file_offsets(&mut p.root, &l.file_offsets, &mut idx);
-    }
+    h.update(hex::decode(payload_root_hash)?);
+    let digest = h.finalize();
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&digest);
+    Ok(raw)
 }
 
 fn load_interface(cfg: &Config, base: &Path) -> Result<Vec<u8>> {
@@ -244,55 +266,31 @@ fn build_components(
             access.push(AccessScope {
                 path: a.clone(),
                 hash: node.hash.clone(),
-                mode: "read".to_string(),
+                mode: AccessMode::Read,
             });
         }
         out.push(ComponentRef {
             name: c.name.clone(),
             world: c.world.clone(),
-            offset: 0,
             length: wasm_blobs[i].len() as u64,
             hash: wasm_hashes[i].clone(),
-            exports: Vec::new(),
+            exports: exports::extract_exports(&wasm_blobs[i]),
             access,
         });
     }
     Ok(out)
 }
 
-#[derive(Serialize)]
-struct SectionEntry {
-    kind: String,
-    name: String,
-    hash: String,
-}
-
-fn build_directory(manifest: &Manifest) -> Vec<SectionEntry> {
-    let mut out = Vec::new();
-    for c in &manifest.components {
-        out.push(SectionEntry {
-            kind: "wasm".to_string(),
-            name: c.name.clone(),
-            hash: c.hash.clone(),
-        });
-    }
-    let mut files = Vec::new();
-    payload::collect_files(&manifest.payloads[0].root, "", &mut files);
-    for (path, hash) in files {
-        out.push(SectionEntry {
-            kind: "payload".to_string(),
-            name: path,
-            hash,
-        });
-    }
-    out
-}
-
-fn collect_payload_blobs(node: &PayloadNode, base: &Path, rel: &Path, out: &mut Vec<(u64, Vec<u8>)>) -> Result<()> {
-    if node.kind == "file" {
+fn collect_payload_blobs(
+    node: &PayloadNode,
+    base: &Path,
+    rel: &Path,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    if node.kind == EntryKind::File {
         let data = std::fs::read(base.join(rel))
             .with_context(|| format!("read payload {}", base.join(rel).display()))?;
-        out.push((node.offset, data));
+        out.push(data);
     } else {
         for c in &node.entries {
             let child_rel = if rel.as_os_str().is_empty() {
@@ -337,4 +335,11 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     hex::encode(&h.finalize())
+}
+
+fn decode_hash(hex_str: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("hash is not 32 bytes"))
 }

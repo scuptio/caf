@@ -4,10 +4,12 @@ use std::path::PathBuf;
 
 mod assemble;
 mod config;
+mod exports;
 mod hex;
 mod layout;
 mod manifest;
 mod payload;
+mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -32,6 +34,21 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         dump_manifest: Option<PathBuf>,
     },
+
+    #[command(about = "Verify a .caf artifact (hash chain, access scopes, signature)")]
+    Verify {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+
+    #[command(about = "Print a human-readable summary of a .caf artifact")]
+    Inspect {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        #[arg(long, help = "Also print the full manifest as JSON")]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -50,6 +67,61 @@ fn main() -> Result<()> {
                 std::fs::write(&p, json)?;
             }
             println!("wrote {} ({} bytes)", output.display(), built.bytes.len());
+        }
+        Command::Verify { file } => {
+            let report = verify::verify(&file)?;
+            println!(
+                "OK {} {}",
+                report.name, report.version
+            );
+            println!("  root hash:     {}", report.root_hash);
+            println!("  manifest hash: {}", report.manifest_hash);
+            println!("  components:    {}", report.components);
+            println!("  payload files: {}", report.payload_files);
+            println!("  capabilities:  {}", report.capabilities.len());
+            for c in &report.capabilities {
+                println!("    - {c}");
+            }
+            if report.signed {
+                let valid = report.signature_valid.unwrap_or(false);
+                println!("  signature:     {}", if valid { "valid" } else { "INVALID" });
+            } else {
+                println!("  signature:     none (unsigned)");
+            }
+        }
+        Command::Inspect { file, json } => {
+            let bytes = std::fs::read(&file)?;
+            let header = layout::read_header(&bytes)?;
+            let manifest_bytes = layout::slice(&bytes, header.manifest_offset, header.manifest_len)?;
+            let manifest: manifest::Manifest =
+                ciborium::de::from_reader(manifest_bytes)?;
+            println!("name:          {}", manifest.name);
+            println!("version:       {}", manifest.version);
+            println!("format:        {}", manifest.format_version);
+            println!("root hash:     {}", hex::encode(&header.root_hash));
+            println!("capabilities:");
+            for c in &manifest.capabilities {
+                println!("  - {c}");
+            }
+            println!("components:");
+            for c in &manifest.components {
+                println!("  - {} (world: {}, exports: {})", c.name, c.world, c.exports.len());
+                for e in &c.exports {
+                    println!("      export {} [{}]", e.export, e.signature);
+                }
+                for a in &c.access {
+                    println!("      access {} ({})", a.path, a.hash);
+                }
+            }
+            let mut files = Vec::new();
+            payload::collect_files(&manifest.payloads[0].root, "", &mut files);
+            println!("payload files: {}", files.len());
+            for (path, hash, len) in &files {
+                println!("  - {path}  {} bytes  {}", len, hash);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            }
         }
     }
     Ok(())

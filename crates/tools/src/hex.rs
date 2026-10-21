@@ -17,7 +17,7 @@ pub fn decode(s: &str) -> Result<Vec<u8>> {
         bail!("hex string has odd length");
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let hi = hex_val(chunk[0]).ok_or_else(|| anyhow::anyhow!("invalid hex digit"))?;
         let lo = hex_val(chunk[1]).ok_or_else(|| anyhow::anyhow!("invalid hex digit"))?;
         out.push((hi << 4) | lo);

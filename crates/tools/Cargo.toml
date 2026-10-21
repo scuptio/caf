@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Build tool for the CAF (Computable Artifact Format) container."
+description = "Build, verify and inspect the CAF (Computable Artifact Format) container."
 
 [[bin]]
 name = "caf-tool"
@@ -19,3 +19,4 @@ toml = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
+wasmparser = { workspace = true }

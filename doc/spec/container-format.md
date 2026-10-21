@@ -41,7 +41,7 @@ file. Sections are 8-byte aligned.
 +-----------------------------------+
 | Interface        (WIT text)       |
 +-----------------------------------+
-| Section Directory (TOC)           |
+| Section Directory (binary TOC)    |
 +-----------------------------------+
 | WASM component #1                 |
 | WASM component #2                 |
@@ -57,6 +57,12 @@ The **bootstrap header** is the only part that must be read eagerly (a few dozen
 bytes); manifest, interface, and directory are the "boot area" read on open (a
 few KB); payload and WASM components are read on demand by offset + HTTP Range.
 A 500 GB remote file is thus opened after reading a few KB.
+
+The **section directory** is a fixed-width binary table (not CBOR): a `u32` entry
+count followed by `count` entries of `tag u8 | offset u64 | length u64 | hash
+[u8; 32]` (49 bytes each). Because every entry is fixed-width and the manifest
+carries *no* offsets, all section offsets are computed in a single forward pass —
+there is no self-referential layout to converge.
 
 ## 2. Manifest
 
@@ -91,10 +97,16 @@ struct Manifest {
     // payload references (virtual filesystem, see §5)
     payloads: Vec<PayloadRef>,
 
-    // content addressing
-    hashes: SectionHashes,           // interface / wasm / payload / manifest / root
+    // content addressing of the *other* sections
+    hashes: SectionHashes,           // interface / wasm / payload
 }
 ```
+
+The manifest carries **no absolute offsets**: section layout (where the
+interface, components, and payload files live) is recorded solely in the section
+directory (§1). This keeps the manifest's content hash independent of layout, so
+`ManifestHash = SHA256(manifest)` is well-defined and there are no
+self-referential hash fields.
 
 ### Component binding & access scope (hard invariant)
 
@@ -106,7 +118,6 @@ any payload node outside its declared scope, by construction, at runtime.
 struct ComponentRef {
     name: String,                    // component name
     world: String,                   // matching WIT world (= interface contract)
-    offset: u64,
     length: u64,
     hash: [u8; 32],
     exports: Vec<ExportEntry>,       // capability -> export name -> function signature
@@ -114,14 +125,15 @@ struct ComponentRef {
 }
 
 struct AccessScope {
-    node: PayloadNode,               // reference to a payload tree node (hash-bound)
+    path: String,                    // logical path within the payload tree
+    hash: [u8; 32],                  // content hash of the scoped node
     mode: AccessMode,                // read-only (only value in v0.1)
 }
 ```
 
-`access` references **payload tree nodes** (`PayloadNode`, see §5), not bare path
-strings, so a scope is bound to content — not to a name that can be forged or
-traversed. Scopes may overlap across components. A component that reads no
+`access` binds a payload **path** to the **content hash** of the tree node it
+resolves to, so a scope is pinned to content — not to a name that can be forged
+or traversed. Scopes may overlap across components. A component that reads no
 payload (e.g. metadata embedded in the WASM itself) may declare `access = []`.
 
 Validation is enforced at three stages; the invariant holds only if all three
@@ -210,23 +222,30 @@ hashed.
 struct PayloadRef {
     root: PayloadNode,               // directory tree root
     media_type: String,              // logical type (not physical format)
-    offset: u64,
     length: u64,
-    hash: [u8; 32],                  // tree root hash (Merkle for large files)
+    hash: [u8; 32],                  // tree root hash
     compressed: Option<Compression>,
 }
 
 struct PayloadNode {
     kind: EntryKind,                 // file | dir
     name: String,
-    hash: [u8; 32],
+    hash: [u8; 32],                  // file: Merkle root over chunks; dir: hash over children
+    length: u64,
     layout: Option<PayloadLayout>,   // file only: opaque / range / stream
+    chunks: Vec<[u8; 32]>,           // file only: chunk hashes (empty for single-chunk)
     entries: Vec<PayloadNode>,       // dir only: children
 }
 ```
 
-- **layout**: `opaque` (whole block) / `range` (range-readable, columnar/tiled)
-  / `stream` (streaming).
+- **layout**: `opaque` (single chunk, whole-block read) / `range` (multi-chunk,
+  range-readable) / `stream` (streaming). A file whose bytes fit in one chunk has
+  `layout: opaque` and `chunks: []`; its hash is the plain SHA-256 of the bytes.
+- **content addressing**: files are split into fixed-size chunks (1 MiB) whose
+  hashes form a Merkle tree; the file's `hash` is the tree root. Larger files are
+  therefore verifiable and readable per-chunk (HTTP Range) without reading the
+  whole file. Directory hashes are computed over their children's
+  `kind | name | hash`.
 - **format-transparent**: payload bytes may be GeoParquet, PMTiles, JSON/CSV,
   model weights, or any private format — only the interface + components know
   how to interpret it.
@@ -260,13 +279,19 @@ the same result everywhere.
 ```text
 InterfaceHash = SHA256(WIT text)
 WasmHash      = SHA256(each component bytes)
-PayloadHash   = SHA256(payload bytes)  (Merkle tree for large files)
-ManifestHash  = SHA256(canonical manifest)
+PayloadHash   = Merkle root over payload chunks (single chunk == SHA256 of bytes)
+ManifestHash  = SHA256(canonical manifest)            -- stored in the directory
 RootHash      = SHA256(ManifestHash || InterfaceHash || WasmHash* || PayloadHash*)
-FileId        = RootHash
+FileId        = RootHash                               -- stored in the header
 ```
 
-Signatures are ed25519 over the canonical manifest (which in turn covers all
+The manifest stores the interface/wasm/payload hashes (of the *other* sections);
+its own hash and the root hash are derived and stored outside the manifest (root
+in the header, manifest hash in the directory), so the manifest is free of
+self-referential hashes and `SHA256(manifest)` always equals the stored
+`ManifestHash`.
+
+Signatures are ed25519 over the canonical manifest bytes (which in turn cover all
 section hashes). Provenance distinguishes **data** / **algorithm** / **artifact**
 publishers.
 
@@ -289,6 +314,6 @@ A profile is a convention layered on top of this generic container. It defines:
 - payload directory conventions (which files live under the payload root),
 - optionally, an execution profile.
 
-The GIS profile is specified in [`gis-profile.md`](gis-profile.md). Other
+The GIS profile is specified in [`../../examples/gis-demo/gis-profile.md`](../../examples/gis-demo/gis-profile.md). Other
 profiles (ML inference, reporting, scientific datasets, agent tools) register
 their own namespaces without touching this document.
