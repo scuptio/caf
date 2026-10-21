@@ -10,6 +10,6 @@ media_type = "application/x-spatial-demo"
 [[components]]
 name = "projection"
 world = "projection"
-path = "projection.wasm"
+path = "gis-demo.wasm"
 capabilities = ["cf:spatial-transform@1"]
 access = []

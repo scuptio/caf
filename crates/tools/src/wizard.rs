@@ -75,6 +75,7 @@ struct RustLib<'a> {
 #[template(path = "rust/build.sh.txt")]
 struct RustBuild<'a> {
     name: &'a str,
+    crate_name: &'a str,
 }
 
 #[derive(Template)]
@@ -156,7 +157,8 @@ fn write_rust(root: &Path, name: &str) -> Result<()> {
     std::fs::create_dir_all(root.join("src"))?;
     render_to(root, "Cargo.toml", &RustCargo { name })?;
     render_to(root, "src/lib.rs", &RustLib { name })?;
-    render_to(root, "build.sh", &RustBuild { name })
+    let crate_name = name.replace('-', "_");
+    render_to(root, "build.sh", &RustBuild { name, crate_name: &crate_name })
 }
 
 fn write_python(root: &Path, name: &str) -> Result<()> {

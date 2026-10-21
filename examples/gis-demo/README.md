@@ -4,34 +4,142 @@
 
 > 核心思想：**不再交付 GIS 数据，而是交付空间能力。** 浏览器只看到 `.caf` 这个不透明容器，至于里面是 GeoJSON 还是 WKB、如何解析，全部由内嵌的 WASM 组件决定。
 
+这个 demo 本身就是一个「用 `caf-tool new` 脚手架出来、再填上真实计算」的项目。下面先讲**如何从零一步步搭出来**，再看它最终长什么样。
+
+## Step by step：从空项目到 `.caf`
+
+先确保 `caf-tool` 在 `PATH` 上（或直接用 `cargo run -p caf-tool -- ...`）：
+
+```bash
+cargo install --path crates/tools
+```
+
+### 0. 用 wizard 生成空项目
+
+```bash
+caf-tool new gis-demo --lang rust
+cd gis-demo
+```
+
+生成：
+
+```text
+gis-demo/
+├── build.toml              # caf-tool 打包配置（通用骨架）
+├── build.sh
+├── Cargo.toml              # Rust crate（通用骨架）
+├── interfaces/gis-demo.wit # 占位接口（一个 ping()）
+├── src/lib.rs              # 最小组件（一个 ping()）
+└── payload/                # 空 payload
+```
+
+### 1. 定义接口（WIT）
+
+把占位接口重命名，并替换成空间能力 `spatial-transform`：
+
+```bash
+mv interfaces/gis-demo.wit interfaces/gis.wit
+```
+
+`interfaces/gis.wit`：
+
+```wit
+package cf:gis@0.1.0;
+
+interface spatial-transform {
+  record point {
+    x: f64,
+    y: f64,
+  }
+
+  reproject: func(x: f64, y: f64, from-code: u32, to-code: u32) -> point;
+}
+
+world projection {
+  export spatial-transform;
+}
+```
+
+### 2. 实现计算（`src/lib.rs`）
+
+把 `src/lib.rs` 里的占位 `ping()` 换成真正的投影 + 要素解析代码（见本仓库的
+`src/lib.rs`）。它通过只读的 `payload-fs` 宿主 ABI（`open`/`read`/`readdir`/`close`）
+读取 payload，并导出 `features()`、`features_from_file()`、`reproject_x()`、
+`reproject_y()`。
+
+### 3. 让打包配置指向真正的组件
+
+改 `build.toml`：组件名、world、capabilities 与接口对齐（`path` 保持 wizard 默认
+的 `gis-demo.wasm` 即可）：
+
+```toml
+interfaces = ["interfaces/gis.wit"]
+
+[[components]]
+name = "projection"
+world = "projection"
+path = "gis-demo.wasm"
+capabilities = ["cf:spatial-transform@1"]
+access = []
+```
+
+### 4. 放入 payload 数据
+
+把源 GeoJSON 放进 `payload/data/`，跑 `make_data.py` 生成第二种开放格式（WKB）：
+
+```bash
+python3 make_data.py
+```
+
+### 5. 构建 `.caf`
+
+```bash
+./build.sh
+# 或手动：
+cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/gis_demo.wasm ./gis-demo.wasm
+caf-tool build -c build.toml -o demo.caf
+```
+
+`caf-tool` 会用 `wit-parser` 校验 WIT，把 `cf:spatial-transform@1` 绑定到 world 的
+`spatial-transform` 导出，再把数据 + 接口 + wasm + 策略 + 身份打成单个 `demo.caf`。
+
+### 6. 校验与查看
+
+```bash
+caf-tool verify demo.caf
+caf-tool inspect demo.caf
+```
+
+`inspect` 会显示 capability 徽章、组件导出（`reproject`）、access scope 与 payload
+文件清单。
+
 ## 目录结构
 
 ```
 gis-demo/
 ├── build.sh              # 一键构建：编译 WASM → 生成数据 → 打包 .caf
 ├── build.toml            # caf-tool 打包配置（名称、接口、payload、组件）
+├── Cargo.toml            # Rust crate（cdylib → wasm32-unknown-unknown）
 ├── make_data.py          # 将 global.geo.json 转换为第二种开放格式 WKB
 ├── interfaces/gis.wit    # WIT 接口：spatial-transform（reproject 能力）
-├── projection/           # Rust → wasm32 组件（数据解析 + 坐标投影）
-│   ├── Cargo.toml
-│   └── src/lib.rs
+├── src/lib.rs            # 数据解析 + 坐标投影（编译为 wasm 组件）
 ├── payload/data/         # 源数据（打包进 .caf 的 payload）
 │   ├── global.geo.json   # GeoJSON / RFC 7946（全球国家边界 + 中国合规国界/九段线）
 │   └── global.wkb        # 由 .geo.json 转换生成的 WKB 流
-├── projection.wasm       # 编译产物
 ├── demo.caf              # 打包产物（最终交付的单一文件）
 └── web/                  # 浏览器演示（静态页面 + CAF 宿主运行时）
     ├── index.html
     ├── caf.js            # CAF 容器解析 + payload-fs 宿主 ABI + WASM 实例化
     ├── app.js            # 渲染 / 交互
-    └── demo.caf          # build.sh 自动复制到此
+    └── demo.caf          # 手动放入 web/ 以供静态托管
 ```
 
-## 快速开始
+## 快速开始（直接跑 demo）
 
 ```bash
-# 1.（可选）重新构建 .caf（已改动 projection / 接口 / 数据时）
-cd faas/examples/gis-demo
+# 1.（可选）重新构建 .caf（已改动 src/lib.rs / 接口 / 数据时）
+cd examples/gis-demo
 bash build.sh
 
 # 2. 静态托管 web/ 目录（必须在 web/ 内启动）
@@ -69,7 +177,7 @@ python3 -m http.server 8000
 
 ## 支持的投影
 
-`interfaces/gis.wit` 中的 `reproject(x, y, from, to)` 能力支持以下坐标参考系（球面，闭式或牛顿迭代公式，正反解均实现）：
+`interfaces/gis.wit` 中的 `reproject(x, y, from-code, to-code)` 能力支持以下坐标参考系（球面，闭式或牛顿迭代公式，正反解均实现）：
 
 | 投影 | 代码 | 类型 |
 |---|---|---|
@@ -87,11 +195,11 @@ python3 -m http.server 8000
 
 1. **CAF 容器**（`caf.js`）：解析文件头、canonical-CBOR manifest、payload 目录树与组件字节。
 2. **宿主 ABI**：浏览器宿主向 WASM 组件暴露一个只读的 `payload-fs`（按路径读写，不暴露偏移/格式）。
-3. **WASM 组件**（`projection/src/lib.rs`）：实现 `features()`（遍历 `/data`、解析每种格式、返回规范化要素）与 `reproject_*`（坐标变换）。
+3. **WASM 组件**（`src/lib.rs`）：实现 `features()`（遍历 `/data`、解析每种格式、返回规范化要素）与 `reproject_*`（坐标变换）。
 4. **渲染**（`app.js`）：把返回的要素按所选投影绘制到 canvas；小区域（< 3px）降级为点标记以免消失。
 
 ## 构建要求
 
 - Rust 工具链（含 `wasm32-unknown-unknown` target）
 - Python 3
-- `caf-tool`（`faas/crates/tools`，由 `build.sh` 自动 `cargo run` 调用）
+- `caf-tool`（`caf/crates/tools`，`cargo install --path crates/tools` 安装）

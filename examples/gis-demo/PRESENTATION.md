@@ -14,7 +14,7 @@
 
 - 数据（`global.geo.json` + `global.wkb`）
 - 接口定义（`gis.wit`，WIT 类型化接口）
-- 可移植计算（`projection.wasm`）
+- 可移植计算（`gis-demo.wasm`）
 - 能力策略 + 内容寻址身份（`root` 哈希）
 
 **对比**：传统交付 GIS 要 `GeoJSON + 前端渲染库 + 后端服务 + 投影工具链` 五件套；CAF 一个文件 + 一个宿主搞定。
