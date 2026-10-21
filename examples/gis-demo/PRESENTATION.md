@@ -63,4 +63,4 @@
 
 传统是把数据交给一堆外置工具去解释；CAF 让数据**自带解释器和能力**，在一个可验证、最小权限、可离线运行的工件里完成。
 
-> 一点提醒：demo 目前只实现了 `features()` + `reproject`（`spatial-transform`）两个能力；`doc/spec/gis-profile.md` 里的 `bounds/query/aggregate/nearest/render` 是规划中的扩展，讲解时可以点一句"往这一档加能力就是改 WIT + 换 WASM 组件，容器格式不动"。
+> 一点提醒：demo 目前只实现了 `features()` + `reproject`（`spatial-transform`）两个能力；`gis-profile.md` 里的 `bounds/query/aggregate/nearest/render` 是规划中的扩展，讲解时可以点一句"往这一档加能力就是改 WIT + 换 WASM 组件，容器格式不动"。
