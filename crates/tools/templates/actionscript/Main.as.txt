@@ -1,0 +1,14 @@
+// {{ name }} — ActionScript has no WASM component toolchain, so this is a
+// structural placeholder only: the CAF container, WIT interface, and payload
+// layout are generated, but the computation must be compiled from another
+// language (e.g. Rust or TinyGo) that targets WebAssembly.
+
+package
+{
+	public class {{ name }}
+	{
+		public static function ping():String {
+			return "pong";
+		}
+	}
+}

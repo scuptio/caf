@@ -1,0 +1,8 @@
+// {{ name }} — CAF component skeleton (TinyGo, wasi).
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("pong")
+}

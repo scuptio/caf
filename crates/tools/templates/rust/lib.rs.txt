@@ -1,0 +1,42 @@
+// {{ name }} — CAF component skeleton (core wasm + read-only payload-fs host ABI).
+
+#[link(wasm_import_module = "caf")]
+unsafe extern "C" {
+    fn open(path_ptr: u32, path_len: u32) -> i32;
+    fn read(fd: i32, buf_ptr: u32, buf_len: u32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn readdir(path_ptr: u32, path_len: u32, buf_ptr: u32, buf_len: u32) -> i32;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alloc(len: u32) -> u32 {
+    if len == 0 {
+        return 0;
+    }
+    let mut boxed: Box<[u8]> = vec![0u8; len as usize].into_boxed_slice();
+    let ptr = boxed.as_mut_ptr() as u32;
+    std::mem::forget(boxed);
+    ptr
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dealloc(ptr: u32, len: u32) {
+    if len == 0 || ptr == 0 {
+        return;
+    }
+    unsafe {
+        let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize);
+        drop(Box::from_raw(slice as *mut [u8]));
+    }
+}
+
+// Replace with your capability; return a JSON string.
+#[unsafe(no_mangle)]
+pub extern "C" fn ping() -> u64 {
+    let s = "pong".to_string();
+    let boxed: Box<[u8]> = s.into_bytes().into_boxed_slice();
+    let ptr = boxed.as_ptr() as u32;
+    let len = boxed.len() as u32;
+    std::mem::forget(boxed);
+    (ptr as u64) | ((len as u64) << 32)
+}

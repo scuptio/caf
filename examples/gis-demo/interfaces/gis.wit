@@ -6,7 +6,7 @@ interface spatial-transform {
     y: f64,
   }
 
-  reproject: func(x: f64, y: f64, from: u32, to: u32) -> point;
+  reproject: func(x: f64, y: f64, from-code: u32, to-code: u32) -> point;
 }
 
 world projection {

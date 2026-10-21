@@ -1,0 +1,15 @@
+name = "{{ name }}"
+version = "0.1.0"
+
+interfaces = ["interfaces/{{ name }}.wit"]
+
+[payload]
+root = "payload"
+media_type = "application/octet-stream"
+
+[[components]]
+name = "{{ name }}"
+world = "{{ name }}-world"
+path = "{{ name }}.wasm"
+capabilities = ["cf:{{ name }}@1"]
+access = []

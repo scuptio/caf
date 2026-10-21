@@ -10,6 +10,8 @@ mod layout;
 mod manifest;
 mod payload;
 mod verify;
+mod wit;
+mod wizard;
 
 #[cfg(test)]
 mod tests;
@@ -48,6 +50,18 @@ enum Command {
 
         #[arg(long, help = "Also print the full manifest as JSON")]
         json: bool,
+    },
+
+    #[command(about = "Scaffold a new CAF project (WIT + build config + language skeleton)")]
+    New {
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        #[arg(long, value_name = "LANG", default_value = "rust")]
+        lang: wizard::Language,
+
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -122,6 +136,9 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
             }
+        }
+        Command::New { name, lang, dir } => {
+            wizard::scaffold(&name, lang, &dir)?;
         }
     }
     Ok(())

@@ -62,6 +62,9 @@ caf/
 # Build the tooling
 cargo build --workspace
 
+# Scaffold a new project (WIT + build config + language skeleton)
+cargo run -p caf-tool -- new my-artifact --lang rust   # rust|python|js|go|as
+
 # Pack a payload directory + interface + WASM components into a .caf artifact
 cargo run -p caf-tool -- build -c build.toml -o artifact.caf \
     --dump-manifest artifact.manifest.json
@@ -75,7 +78,10 @@ cargo run -p caf-tool -- inspect artifact.caf
 
 `caf-tool` compiles the `build.toml` configuration (artifact identity, WIT
 interfaces, WASM components, capability/access declarations, and payload) into a
-single content-addressed `.caf` file.
+single content-addressed `.caf` file. It validates the WIT interfaces with
+`wit-parser`, binds each declared capability to its world export, and (with
+`embed = true` on a component) embeds the world metadata into the module via
+`wit-component`.
 
 For a complete, runnable end-to-end example — including a browser host runtime,
 a WASM component, and a payload in multiple open formats — see

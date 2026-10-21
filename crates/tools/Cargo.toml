@@ -20,3 +20,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
 wasmparser = { workspace = true }
+wit-parser = { version = "0.262", features = ["decoding"] }
+wit-component = "0.262"
+wasm-metadata = "0.262"
+askama = "0.16.1"

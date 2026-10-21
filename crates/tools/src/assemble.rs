@@ -11,6 +11,7 @@ use crate::layout::{
 };
 use crate::manifest::*;
 use crate::payload;
+use crate::wit;
 
 pub struct BuildOutput {
     pub bytes: Vec<u8>,
@@ -19,18 +20,27 @@ pub struct BuildOutput {
 
 pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     // 1. Interface (WIT text) and its hash.
-    let interface_bytes = load_interface(cfg, base)?;
+    let interface_sources = load_interfaces(cfg, base)?;
+    let interface_bytes = interface_sources.join("\n").into_bytes();
     let interface_hash = sha256_hex(&interface_bytes);
 
-    // 2. WASM component blobs, hashes, and extracted exports.
-    let (wasm_blobs, wasm_hashes) = load_components(cfg, base)?;
+    // 2. Parse/validate the WIT once (when any interface file is declared).
+    let wit = if interface_sources.is_empty() {
+        None
+    } else {
+        Some(wit::parse(&interface_sources)?)
+    };
 
     // 3. Payload tree (chunked Merkle hashing).
     let payload_root = payload::build_tree(&base.join(&cfg.payload.root))?;
     let payload_root_hash = payload_root.hash.clone();
 
-    // 4. Component refs: access scopes (path + content hash) and exports.
-    let components = build_components(cfg, &payload_root, &wasm_hashes, &wasm_blobs)?;
+    // 4. WASM components: load, optionally embed world metadata, hash, and
+    //    build refs with access scopes + capability-bound exports.
+    let built = build_components(cfg, base, &payload_root, &wit)?;
+    let wasm_blobs = &built.blobs;
+    let wasm_hashes = &built.hashes;
+    let components = built.refs;
 
     // 5. Capabilities (parsed and deduplicated).
     let capabilities = collect_capabilities(cfg)?;
@@ -144,7 +154,7 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     let directory_bytes = layout::encode_directory(&entries);
 
     // 11. Root hash = SHA256(ManifestHash || InterfaceHash || WasmHash* || PayloadHash*).
-    let root_hash = compute_root_hash(&manifest_hash, &interface_hash, &wasm_hashes, &payload_root_hash)?;
+    let root_hash = compute_root_hash(&manifest_hash, &interface_hash, wasm_hashes, &payload_root_hash)?;
 
     // 12. Write the file.
     let mut out = Vec::new();
@@ -227,38 +237,68 @@ fn compute_root_hash(
     Ok(raw)
 }
 
-fn load_interface(cfg: &Config, base: &Path) -> Result<Vec<u8>> {
-    let mut text = String::new();
-    for (i, p) in cfg.interfaces.iter().enumerate() {
-        if i > 0 {
-            text.push('\n');
-        }
-        let s = std::fs::read_to_string(base.join(p)).with_context(|| format!("read wit {p}"))?;
-        text.push_str(&s);
-    }
-    Ok(text.into_bytes())
+fn load_interfaces(cfg: &Config, base: &Path) -> Result<Vec<String>> {
+    cfg.interfaces
+        .iter()
+        .map(|p| std::fs::read_to_string(base.join(p)).with_context(|| format!("read wit {p}")))
+        .collect()
 }
 
-fn load_components(cfg: &Config, base: &Path) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
-    let mut blobs = Vec::new();
-    let mut hashes = Vec::new();
-    for c in &cfg.components {
-        let b =
-            std::fs::read(base.join(&c.path)).with_context(|| format!("read wasm {}", c.path))?;
-        hashes.push(sha256_hex(&b));
-        blobs.push(b);
-    }
-    Ok((blobs, hashes))
+struct Components {
+    blobs: Vec<Vec<u8>>,
+    hashes: Vec<String>,
+    refs: Vec<ComponentRef>,
 }
 
 fn build_components(
     cfg: &Config,
+    base: &Path,
     payload_root: &PayloadNode,
-    wasm_hashes: &[String],
-    wasm_blobs: &[Vec<u8>],
-) -> Result<Vec<ComponentRef>> {
-    let mut out = Vec::with_capacity(cfg.components.len());
-    for (i, c) in cfg.components.iter().enumerate() {
+    wit: &Option<wit::Wit>,
+) -> Result<Components> {
+    let mut out = Components {
+        blobs: Vec::with_capacity(cfg.components.len()),
+        hashes: Vec::with_capacity(cfg.components.len()),
+        refs: Vec::with_capacity(cfg.components.len()),
+    };
+
+    for c in &cfg.components {
+        let mut blob =
+            std::fs::read(base.join(&c.path)).with_context(|| format!("read wasm {}", c.path))?;
+
+        // Resolve this component's world in the parsed WIT (if any).
+        let world = match wit {
+            Some(w) => {
+                let name = if c.world.is_empty() {
+                    None
+                } else {
+                    Some(c.world.as_str())
+                };
+                Some(wit::world(w, name)?)
+            }
+            None => None,
+        };
+
+        // Optionally embed the world metadata into the module (real components).
+        if let (Some(w), Some(world)) = (wit.as_ref(), world)
+            && c.embed
+        {
+            blob = wit::embed_metadata(w, world, &blob)?;
+        }
+
+        let hash = sha256_hex(&blob);
+        let len = blob.len() as u64;
+
+        // Exports: bind declared capabilities to the world's exports; without a
+        // WIT world, fall back to raw WASM export names.
+        let exports = match (wit.as_ref(), world) {
+            (Some(w), Some(world)) => {
+                let world_exports = wit::exports(w, world);
+                bind_capabilities(&c.capabilities, &world_exports)?
+            }
+            _ => exports::extract_exports(&blob),
+        };
+
         let mut access = Vec::with_capacity(c.access.len());
         for a in &c.access {
             let node = payload::find(payload_root, a)
@@ -269,14 +309,40 @@ fn build_components(
                 mode: AccessMode::Read,
             });
         }
-        out.push(ComponentRef {
+
+        out.hashes.push(hash.clone());
+        out.blobs.push(blob);
+        out.refs.push(ComponentRef {
             name: c.name.clone(),
             world: c.world.clone(),
-            length: wasm_blobs[i].len() as u64,
-            hash: wasm_hashes[i].clone(),
-            exports: exports::extract_exports(&wasm_blobs[i]),
+            length: len,
+            hash,
+            exports,
             access,
         });
+    }
+
+    Ok(out)
+}
+
+fn bind_capabilities(
+    capabilities: &[String],
+    world_exports: &[wit::WorldExport],
+) -> Result<Vec<ExportEntry>> {
+    let mut out = Vec::new();
+    for cap_str in capabilities {
+        let cap = CapabilityId::parse(cap_str).map_err(anyhow::Error::msg)?;
+        let we = world_exports
+            .iter()
+            .find(|w| w.name == cap.name)
+            .with_context(|| format!("capability '{cap_str}' has no matching world export"))?;
+        for f in &we.functions {
+            out.push(ExportEntry {
+                capability: cap.to_string(),
+                export: f.name.clone(),
+                signature: f.signature.clone(),
+            });
+        }
     }
     Ok(out)
 }

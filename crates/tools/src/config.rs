@@ -41,6 +41,8 @@ pub struct ComponentConfig {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub access: Vec<String>,
+    #[serde(default)]
+    pub embed: bool,
 }
 
 #[derive(Deserialize)]

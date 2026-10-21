@@ -1,0 +1,6 @@
+# {{ name }} — CAF component skeleton (Python).
+# Implement your capability and compile with componentize-py:
+#   componentize-py -d . -w {{ name }}.wit componentize app -o {{ name }}.wasm
+
+def ping() -> str:
+    return "pong"

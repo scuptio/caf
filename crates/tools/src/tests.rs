@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::{assemble, config, hex, layout, manifest, payload, verify};
+use crate::{assemble, config, hex, layout, manifest, payload, verify, wizard};
 
 fn temp_root(name: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("caf-tool-test-{}-{}", std::process::id(), name));
@@ -38,7 +38,7 @@ fn write_config_impl(dir: &Path, access: &[&str], seed: Option<&str>) -> Result<
     std::fs::write(dir.join("build.toml"), toml)?;
     std::fs::write(
         dir.join("spatial.wit"),
-        "package cf:gis@0.1.0;\nworld spatial-file {\n  export metadata: interface { name: func() -> string; }\n}\n",
+        "package cf:gis@0.1.0;\nworld spatial-file {\n  export metadata: interface { name: func() -> string; }\n  export spatial-query: interface { query: func() -> string; }\n}\n",
     )?;
     std::fs::write(dir.join("spatial.wasm"), b"\0asm\x01\0\0\0")?;
     std::fs::write(dir.join("payload/data/city.parquet"), b"parquet-bytes")?;
@@ -80,6 +80,10 @@ fn builds_a_caf_file() -> Result<()> {
     assert_eq!(manifest.components.len(), 1);
     assert_eq!(manifest.components[0].access.len(), 2);
     assert_eq!(manifest.capabilities.len(), 2);
+    // Capabilities are bound to the world's exports.
+    assert_eq!(manifest.components[0].exports.len(), 2);
+    assert_eq!(manifest.components[0].exports[0].capability, "cf:metadata@1");
+    assert_eq!(manifest.components[0].exports[1].capability, "cf:spatial-query@1");
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
@@ -230,6 +234,33 @@ fn large_file_is_chunked() -> Result<()> {
     assert_ne!(hash, sha256_hex(&data));
     // And it matches the verifier.
     assert_eq!(payload::verify_file(&data)?, hash);
+    Ok(())
+}
+
+#[test]
+fn wizard_scaffolds_and_builds() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("caf-tool-wiz-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+
+    wizard::scaffold("demo", wizard::Language::Rust, &dir)?;
+    let proj = dir.join("demo");
+    std::fs::write(proj.join("demo.wasm"), b"\0asm\x01\0\0\0")?;
+
+    let (cfg, base) = config::load(&proj.join("build.toml"))?;
+    let built = assemble::assemble(&cfg, &base)?;
+
+    let report = verify::verify_bytes(&built.bytes)?;
+    assert_eq!(report.name, "demo");
+    assert_eq!(built.manifest.components[0].exports.len(), 1);
+    assert_eq!(
+        built.manifest.components[0].exports[0].capability,
+        "cf:demo@1"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 

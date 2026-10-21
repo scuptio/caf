@@ -1,0 +1,6 @@
+// {{ name }} — CAF component skeleton (JavaScript, via jco).
+// Implement your capability and compile with jco.
+
+export function ping() {
+  return "pong";
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+componentize-py -d . -w {{ name }}.wit componentize app -o {{ name }}.wasm
+caf-tool build -c build.toml -o {{ name }}.caf

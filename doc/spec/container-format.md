@@ -131,6 +131,12 @@ struct AccessScope {
 }
 ```
 
+`exports` is populated at build time from the WIT world: for each declared
+capability `ns:name@ver`, the world's `name` export is located and its functions
+are bound to that capability id. A capability declared without a matching world
+export is a build error. Without a WIT world, `exports` falls back to the raw
+WASM export names (empty capability).
+
 `access` binds a payload **path** to the **content hash** of the tree node it
 resolves to, so a scope is pinned to content — not to a name that can be forged
 or traversed. Scopes may overlap across components. A component that reads no
