@@ -29,6 +29,31 @@ jobs:
       - name: Browser host smoke test (Node)
         run: node examples/gis-demo/web/caf.test.mjs
 
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build tooling and demo artifact
+        run: |
+          cargo build -p caf-tool
+          cd examples/gis-demo
+          cargo build --release --target wasm32-unknown-unknown
+          cp target/wasm32-unknown-unknown/release/gis_demo.wasm gis-demo.wasm
+          python3 make_data.py
+          ../../target/debug/caf-tool build -c build.toml -o demo.caf
+          cp demo.caf web/demo.caf
+      - name: Browser e2e (system Chrome via playwright-core)
+        run: |
+          cd examples/gis-demo/e2e
+          npm install --no-audit --no-fund
+          node demo.spec.mjs
+
   fuzz-build:
     runs-on: ubuntu-latest
     continue-on-error: true
