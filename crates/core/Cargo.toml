@@ -1,0 +1,14 @@
+[package]
+name = "caf-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Shared CAF (Computable Artifact Format) container parsing and verification."
+
+[dependencies]
+serde = { workspace = true }
+ciborium = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+anyhow = { workspace = true }

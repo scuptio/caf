@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use askama::Template;
 use clap::ValueEnum;
 use std::path::Path;
@@ -158,7 +158,14 @@ fn write_rust(root: &Path, name: &str) -> Result<()> {
     render_to(root, "Cargo.toml", &RustCargo { name })?;
     render_to(root, "src/lib.rs", &RustLib { name })?;
     let crate_name = name.replace('-', "_");
-    render_to(root, "build.sh", &RustBuild { name, crate_name: &crate_name })
+    render_to(
+        root,
+        "build.sh",
+        &RustBuild {
+            name,
+            crate_name: &crate_name,
+        },
+    )
 }
 
 fn write_python(root: &Path, name: &str) -> Result<()> {

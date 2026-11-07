@@ -114,6 +114,20 @@ caf-tool inspect demo.caf
 `inspect` 会显示 capability 徽章、组件导出（`reproject`）、access scope 与 payload
 文件清单。
 
+### 7. 执行能力（caf-runtime）
+
+`caf-runtime` 会校验工件、实例化组件，并强制 `payload-fs` 只读 ABI + 能力策略 +
+fuel 限额，然后调用组件函数：
+
+```bash
+caf-tool run demo.caf --fn reproject_x --args 120,30,4326,3857
+# [0] f64: 13358338.895192828
+
+caf-tool run demo.caf --fn features
+# [0] i64: 47840777422831640
+#     (string) {"crs":"EPSG:4326","features":[...]}
+```
+
 ## 目录结构
 
 ```
@@ -130,8 +144,9 @@ gis-demo/
 ├── demo.caf              # 打包产物（最终交付的单一文件）
 └── web/                  # 浏览器演示（静态页面 + CAF 宿主运行时）
     ├── index.html
-    ├── caf.js            # CAF 容器解析 + payload-fs 宿主 ABI + WASM 实例化
+    ├── caf.js            # CAF 容器解析 + 分块懒校验 + payload-fs 宿主 ABI + WASM 实例化
     ├── app.js            # 渲染 / 交互
+    ├── caf.test.mjs      # Node 冒烟测试（三种加载路径）
     └── demo.caf          # 手动放入 web/ 以供静态托管
 ```
 
@@ -142,8 +157,9 @@ gis-demo/
 cd examples/gis-demo
 bash build.sh
 
-# 2. 静态托管 web/ 目录（必须在 web/ 内启动）
+# 2. 静态托管 web/ 目录（必须在 web/ 内启动；demo.caf 需先拷入 web/）
 cd web
+cp ../demo.caf .
 python3 -m http.server 8000
 
 # 3. 浏览器打开 http://localhost:8000
@@ -151,7 +167,25 @@ python3 -m http.server 8000
 
 打开后会自动加载 `demo.caf`；也可以点 "Open .caf file" 或拖入任意 `.caf` 文件。
 
-> 注意：直接双击 `index.html`（`file://`）时 `fetch("demo.caf")` 会失败，需手动打开文件，因此推荐用上面的 HTTP 方式。
+**加载模式**（`caf.js` 自动选择）：
+
+- **Range + JSPI**：服务器支持 HTTP Range（nginx、CDN 等；`python3 -m http.server`
+  不支持）且浏览器支持 JSPI 时，工件按需分块读取——打开只取 boot 区与组件，
+  payload 分块 Merkle 校验后懒加载，信息面板可见实际读取字节数。
+- **整文件回退**：无 Range 或 JSPI 时一次 GET 下载全文件，随后分块懒校验
+  （语义相同，只是字节已全量落地）。
+- **本地文件**：拖入/选择 `.caf` 文件（`file://` 直接双击 index.html 时
+  `fetch("demo.caf")` 会失败，属浏览器限制，手动打开即可）。
+
+无后端时也可用 Node 直接冒烟测试宿主运行时：
+
+```bash
+node examples/gis-demo/web/caf.test.mjs   # 覆盖 整文件回退 / Range / 内存 / 跨宿主一致性
+```
+
+> 不可信工件可用 Worker 模式运行（`CAF.openCafWorker(...)`）：组件跑在 Web
+> Worker 中，主线程看门狗超时即终止——这是对 CPU/内存失控的尽力兜底（JS 宿主
+> 无法做指令级计量），渲染等热路径仍应使用可信工件的主线程模式。
 
 ## 数据与格式
 
@@ -193,8 +227,8 @@ python3 -m http.server 8000
 
 ## 工作原理
 
-1. **CAF 容器**（`caf.js`）：解析文件头、canonical-CBOR manifest、payload 目录树与组件字节。
-2. **宿主 ABI**：浏览器宿主向 WASM 组件暴露一个只读的 `payload-fs`（按路径读写，不暴露偏移/格式）。
+1. **CAF 容器**（`caf.js`）：解析文件头、canonical-CBOR manifest、payload 目录树与组件字节；payload 按 1 MiB 分块在读取时做 Merkle 校验（懒校验），支持 HTTP Range 按需取块。
+2. **宿主 ABI**：浏览器宿主向 WASM 组件暴露一个只读的 `payload-fs`（按路径读写，不暴露偏移/格式），并按 manifest 声明的策略做导入准入检查。
 3. **WASM 组件**（`src/lib.rs`）：实现 `features()`（遍历 `/data`、解析每种格式、返回规范化要素）与 `reproject_*`（坐标变换）。
 4. **渲染**（`app.js`）：把返回的要素按所选投影绘制到 canvas；小区域（< 3px）降级为点标记以免消失。
 

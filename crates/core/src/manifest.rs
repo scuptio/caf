@@ -170,6 +170,7 @@ pub struct ExecutionProfile {
 pub struct ResourceLimits {
     pub memory_max: u64,
     pub cpu_fuel: u64,
+    pub read_max: u64,
     pub output_max: u64,
 }
 

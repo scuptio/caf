@@ -18,6 +18,9 @@ pub struct WorldExport {
 pub struct FunctionExport {
     pub name: String,
     pub signature: String,
+    /// Whether the signature needs the caf-abi memory bridge (complex
+    /// params/results — anything beyond scalars).
+    pub needs_bridge: bool,
 }
 
 /// Parse one or more WIT source files into a single `Resolve`.
@@ -55,6 +58,7 @@ pub fn exports(wit: &Wit, world: WorldId) -> Vec<WorldExport> {
                     .map(|(n, f)| FunctionExport {
                         name: n.clone(),
                         signature: func_signature(f),
+                        needs_bridge: func_needs_memory_bridge(&wit.resolve, f),
                     })
                     .collect();
                 out.push(WorldExport { name, functions });
@@ -65,6 +69,7 @@ pub fn exports(wit: &Wit, world: WorldId) -> Vec<WorldExport> {
                     functions: vec![FunctionExport {
                         name: f.name.clone(),
                         signature: func_signature(f),
+                        needs_bridge: func_needs_memory_bridge(&wit.resolve, f),
                     }],
                 });
             }
@@ -108,4 +113,25 @@ fn func_signature(f: &Function) -> String {
         .join(", ");
     let result = if f.result.is_some() { " -> result" } else { "" };
     format!("func({params}){result}")
+}
+
+/// A WIT type needs the caf-abi memory bridge unless it is a plain scalar
+/// (bool/char/int/float, plus flags and enums, which lower to integers).
+fn type_needs_bridge(resolve: &Resolve, ty: &wit_parser::Type) -> bool {
+    use wit_parser::{Type, TypeDefKind};
+    match ty {
+        Type::String => true,
+        Type::Id(id) => match &resolve.types[*id].kind {
+            TypeDefKind::Type(inner) => type_needs_bridge(resolve, inner),
+            TypeDefKind::Flags(_) | TypeDefKind::Enum(_) => false,
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a WIT function's params or result need the caf-abi memory bridge.
+pub fn func_needs_memory_bridge(resolve: &Resolve, f: &Function) -> bool {
+    f.params.iter().any(|p| type_needs_bridge(resolve, &p.ty))
+        || f.result.is_some_and(|t| type_needs_bridge(resolve, &t))
 }

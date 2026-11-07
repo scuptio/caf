@@ -56,7 +56,9 @@ file. Sections are 8-byte aligned.
 The **bootstrap header** is the only part that must be read eagerly (a few dozen
 bytes); manifest, interface, and directory are the "boot area" read on open (a
 few KB); payload and WASM components are read on demand by offset + HTTP Range.
-A 500 GB remote file is thus opened after reading a few KB.
+A remote artifact is thus opened after reading only the boot area plus the
+(small) component bytes — see §10 for the incremental-verification contract
+that makes this sound.
 
 The **section directory** is a fixed-width binary table (not CBOR): a `u32` entry
 count followed by `count` entries of `tag u8 | offset u64 | length u64 | hash
@@ -92,7 +94,6 @@ struct Manifest {
     // security & trust
     policy: CapabilityPolicy,
     provenance: Provenance,
-    trust: Option<TrustInfo>,        // reserved
 
     // payload references (virtual filesystem, see §5)
     payloads: Vec<PayloadRef>,
@@ -193,9 +194,14 @@ The container layer treats WIT as opaque text; all profile semantics live here.
 
 ## 4. WASM components
 
-Computation is distributed as WASM **components** (component model), one per
-exported capability, matching a WIT world. The host ABI exposed to a component
-is minimal and read-only:
+Computation is distributed as WASM modules matching a WIT world, one per
+exported capability. Format v1 executes **core modules** against the `caf.*`
+host ABI described below (imports are enumerated at open time and resolved
+against the declared policy, fail-closed); embedding component-model metadata
+is supported at build time, and the value-encoding contract that applies until
+true Component Model instantiation lands is specified in
+[`caf-abi.md`](caf-abi.md). The host ABI exposed to a component is minimal and
+read-only:
 
 ```text
 payload-fs      (POSIX-like filesystem; preopened per-component scope)
@@ -206,9 +212,18 @@ payload-fs      (POSIX-like filesystem; preopened per-component scope)
   seek(fd: fd, offset: u64)
   close(fd: fd)
 self.size() -> u64                  (whole-file byte count)
+emit(bytes)                         (structured result output, charged to output_max)
+log(bytes)                          (diagnostic output, charged to output_max)
+abort(code)                         (explicit deterministic trap)
 memory                              (host-managed linear memory)
-return                              (component result)
+return                              (component result, charged to output_max)
 ```
+
+The `payload-fs` functions are provided only when the policy grants `self_read`;
+`self.size` / `emit` / `log` / `abort` are always available. Every byte that
+crosses the host boundary as output — `emit`, `log`, and the return channel
+(result values plus bytes the host reads out of component memory) — is charged
+against `output_max`.
 
 By default components have **no** network / external filesystem / process /
 environment / clock / random access. The only filesystem is the payload root,
@@ -257,6 +272,11 @@ struct PayloadNode {
   how to interpret it.
 - **read-only**: the tree is read-only; components may only
   `open/read/readdir/stat/seek/close` (Immutable by Default).
+- **uncompressed in v1**: the `compressed` field is reserved. Runtimes reject a
+  non-`None` value at open time (fail-closed) rather than risk serving bytes a
+  component cannot interpret. Chunk-aligned compression is a v2 topic.
+- **one tree in v1**: this format version carries exactly one payload tree;
+  the root-hash construction (§7) already leaves room for more.
 
 ## 6. Execution profile & resource limits
 
@@ -273,23 +293,48 @@ capabilities:
 resources:
   memory_max: 256MiB
   cpu_fuel: 100000000
+  read_max: 1GiB
   output_max: 64MiB
 ```
 
-`caf-d1` defines canonical NaN behavior, fixed numeric semantics, and a frozen
-imported interface set so the same `(FileId, FunctionId, Args, Profile)` yields
-the same result everywhere.
+`caf-d1` defines canonical NaN behavior, a deterministic relaxed-SIMD subset, no
+threads, and no clock/random/environment imports, so the same `(FileId,
+FunctionId, Args, Profile)` yields the same result everywhere. A profile is a
+machine-checkable engine configuration: `caf-d1` requires `deterministic:
+true`, and a profile the runtime does not know is rejected at open time
+(fail-closed) rather than silently ignored.
+
+All four budgets are enforced — none is a dead declaration:
+
+| budget | enforcement point |
+|---|---|
+| `memory_max` | store linear-memory limit (+ bounded host-side payload buffering) |
+| `cpu_fuel` | engine fuel, decremented per instruction |
+| `read_max` | bytes actually fetched from the payload backing store (cache hits excluded) |
+| `output_max` | bytes crossing the host boundary via emit / log / the return channel |
 
 ## 7. Identity & verification
 
 ```text
-InterfaceHash = SHA256(WIT text)
-WasmHash      = SHA256(each component bytes)
-PayloadHash   = Merkle root over payload chunks (single chunk == SHA256 of bytes)
-ManifestHash  = SHA256(canonical manifest)            -- stored in the directory
-RootHash      = SHA256(ManifestHash || InterfaceHash || WasmHash* || PayloadHash*)
-FileId        = RootHash                               -- stored in the header
+InterfaceHash   = SHA256(WIT text)
+WasmHash        = SHA256(each component bytes)
+PayloadRootHash = root hash of the payload tree (file hash = chunk-Merkle root;
+                  a single-chunk file hashes to the plain SHA-256 of its bytes)
+ManifestHash    = SHA256(canonical manifest)          -- stored in the directory
+RootHash        = SHA256("CAF1"
+                         || u64le(len) || ManifestHash
+                         || u64le(len) || InterfaceHash
+                         || u64le(n)   || (u64le(len) || WasmHash)*
+                         || u64le(len) || PayloadRootHash)
+FileId          = RootHash                             -- stored in the header
 ```
+
+The `"CAF1"` domain separator, explicit length prefixes, and the component count
+make the hash input unambiguous to parse and leave room for multiple payloads or
+a future hash-algorithm migration. Because the manifest hash transitively covers
+the policy, execution profile, interface ref, component refs, access scopes, and
+payload tree, binding strength is equivalent to hashing those fields directly.
+This format version carries exactly one payload tree.
 
 The manifest stores the interface/wasm/payload hashes (of the *other* sections);
 its own hash and the root hash are derived and stored outside the manifest (root
@@ -300,6 +345,31 @@ self-referential hashes and `SHA256(manifest)` always equals the stored
 Signatures are ed25519 over the canonical manifest bytes (which in turn cover all
 section hashes). Provenance distinguishes **data** / **algorithm** / **artifact**
 publishers.
+
+### 7.1 Trust model
+
+The signature section carries `(pubkey, signature)`: the key needed to verify
+travels inside the file. A valid signature therefore proves **integrity and
+self-consistency** — the manifest was signed by the holder of the matching
+private key — but says nothing about *who* that holder is. Authenticity is
+established out of band:
+
+- **Signer fingerprint**: `SHA256(pubkey)`, hex-encoded. `caf-tool verify`
+  prints it for every signed artifact.
+- **Trust store**: consumers keep an external mapping from fingerprints to
+  publisher identities. `caf-tool verify --trusted-keys keys.toml` resolves
+  the signer against it (TOML: `[keys] <fingerprint> = "publisher name"`), and
+  `--require-trusted` turns an unknown or unsigned artifact into a hard error.
+- **TOFU by default**: without a trust store, first use of a fingerprint is a
+  decision point for the consumer; distributions are expected to publish their
+  fingerprint through a separate authenticated channel (project site, signed
+  release notes, …), exactly like SSH host keys.
+- **Browser verification**: the JS host verifies signatures with WebCrypto
+  Ed25519 (supported in current Chrome/Edge/Safari/Firefox). On a platform
+  without it, verification degrades to "unverifiable" with a warning rather
+  than rejection — integrity is still guaranteed by the hash chain.
+
+Multiple signers and certificate chains are v2 topics.
 
 ## 8. Result verification
 
@@ -323,3 +393,57 @@ A profile is a convention layered on top of this generic container. It defines:
 The GIS profile is specified in [`../../examples/gis-demo/gis-profile.md`](../../examples/gis-demo/gis-profile.md). Other
 profiles (ML inference, reporting, scientific datasets, agent tools) register
 their own namespaces without touching this document.
+
+## 10. Opening & incremental verification
+
+A host opens an artifact **lazily** over its backing store (local file, HTTP
+Range endpoint, object storage). Opening reads and verifies only:
+
+1. the bootstrap header,
+2. the boot area — manifest (pinned by the directory's manifest entry),
+   interface (pinned by the manifest), and the section directory,
+3. each component's bytes (small; hash-verified, then admission enumerates
+   their imports against the declared policy),
+4. the 96-byte signature section, if present.
+
+The payload tree's structure (directory hashes) and every declared access
+scope are checked against the manifest at open. **Payload bytes are verified
+incrementally**: when a component reads `[pos, pos + len)` of a payload file,
+the host fetches only the covering 1 MiB chunks and checks each chunk against
+the manifest's chunk hashes *before* handing bytes to the guest. Every byte a
+component receives is therefore verified before use; bytes that are never read
+are never fetched or verified. Hosts may cache verified chunk bytes; the
+`read_max` budget counts bytes actually pulled from the backing store, cache
+hits excluded.
+
+The security invariant is unchanged versus whole-file verification: tampering
+is detected before the affected bytes are used, and undetected tampering is
+impossible — only *detection latency* moves from open time to first read.
+
+Note on scale: the manifest carries the chunk hashes, so its size grows with
+payload size (32 bytes per 1 MiB chunk). This keeps even large artifacts'
+boot areas small (≈32 KB per GiB of payload); profiles shipping enormous
+payloads should prefer fewer, larger payload files to keep directory and tree
+overhead proportional.
+
+Note on JS hosts: true on-demand Range reads additionally require JSPI
+(`WebAssembly.Suspending`) so the synchronous payload-fs ABI can wait on async
+fetches. Where JSPI is unavailable the whole artifact downloads once and is
+then lazily verified in memory. Profiles that must stay interactive under
+whole-file download should ship **multiple smaller artifacts** (e.g. one for
+text, one per media bundle) rather than one giant file — composition over
+size, and no format change required.
+
+## 11. Versioning & stability
+
+- `format_version` (header + manifest) is the container contract. v1 readers
+  reject a higher major version at the header, before any further parsing.
+- While the format is at draft stage (`0.1.x`), byte layout may change between
+  releases with a `format_version` bump; no compatibility guarantee is made.
+- Starting with the first stable tag (`1.0`): readers accept all artifacts of
+  the same major version; a reader rejects only *higher* major versions.
+  Profiles version independently (`namespace:name@version`); artifact
+  versions are semver per artifact.
+- WIT interfaces inside an artifact follow normal semantic-import
+  versioning: adding functions is a minor capability change; changing or
+  removing one requires a capability version bump.

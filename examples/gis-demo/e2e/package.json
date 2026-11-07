@@ -1,0 +1,11 @@
+{
+  "name": "gis-demo-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node demo.spec.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

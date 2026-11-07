@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub const MAGIC: [u8; 4] = *b"CAF\0";
 pub const HEADER_SIZE: u64 = 92;
@@ -124,14 +124,25 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<DirectoryEntry>> {
         )
         .context("directory size overflow")?;
     if bytes.len() < expected {
-        bail!("directory truncated: expected {expected} bytes, got {}", bytes.len());
+        bail!(
+            "directory truncated: expected {expected} bytes, got {}",
+            bytes.len()
+        );
     }
     let mut entries = Vec::with_capacity(count);
     let mut pos = 4usize;
     for _ in 0..count {
         let tag = bytes[pos];
-        let offset = le_u64(bytes.get(pos + 1..pos + 9).context("directory entry truncated")?)?;
-        let length = le_u64(bytes.get(pos + 9..pos + 17).context("directory entry truncated")?)?;
+        let offset = le_u64(
+            bytes
+                .get(pos + 1..pos + 9)
+                .context("directory entry truncated")?,
+        )?;
+        let length = le_u64(
+            bytes
+                .get(pos + 9..pos + 17)
+                .context("directory entry truncated")?,
+        )?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(
             bytes

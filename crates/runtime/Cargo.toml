@@ -1,0 +1,15 @@
+[package]
+name = "caf-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "CAF host runtime: execute WASM components against a .caf artifact with capability enforcement."
+
+[dependencies]
+caf-core = { workspace = true }
+caf-security = { workspace = true }
+wasmtime = { workspace = true }
+wasmparser = { workspace = true }
+ciborium = { workspace = true }
+anyhow = { workspace = true }

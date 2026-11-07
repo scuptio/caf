@@ -19,7 +19,10 @@ toml = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
 wasmparser = { workspace = true }
+caf-core = { workspace = true }
+caf-runtime = { workspace = true }
 wit-parser = { version = "0.262", features = ["decoding"] }
 wit-component = "0.262"
 wasm-metadata = "0.262"

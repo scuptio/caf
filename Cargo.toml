@@ -23,6 +23,14 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # WASM parsing (component export inspection; lightweight, no codegen).
 wasmparser = "0.262"
 
+# WASM host runtime.
+wasmtime = "50"
+
+# Internal crates.
+caf-core = { path = "crates/core" }
+caf-runtime = { path = "crates/runtime" }
+caf-security = { path = "crates/security" }
+
 # Misc.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

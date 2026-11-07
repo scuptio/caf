@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "caf-guest"
+version = "0.1.0"
+
+[[package]]
 name = "gis-demo"
 version = "0.1.0"
 dependencies = [
+ "caf-guest",
  "serde",
  "serde_json",
 ]

@@ -3,14 +3,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
-use crate::exports;
-use crate::hex;
-use crate::layout::{
+use caf_core::hex;
+use caf_core::layout::{
     self, DirectoryEntry, FLAG_SIGNED, TAG_COMPONENT, TAG_MANIFEST, TAG_PAYLOAD, TAG_SIGNATURE,
 };
-use crate::manifest::*;
-use crate::payload;
+use caf_core::manifest::*;
+use caf_core::payload;
+
+use crate::config::Config;
+use crate::exports;
 use crate::wit;
 
 pub struct BuildOutput {
@@ -64,6 +65,7 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
         resources: ResourceLimits {
             memory_max: cfg.resources.memory_max,
             cpu_fuel: cfg.resources.cpu_fuel,
+            read_max: cfg.resources.read_max,
             output_max: cfg.resources.output_max,
         },
         policy: CapabilityPolicy {
@@ -153,8 +155,13 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     }
     let directory_bytes = layout::encode_directory(&entries);
 
-    // 11. Root hash = SHA256(ManifestHash || InterfaceHash || WasmHash* || PayloadHash*).
-    let root_hash = compute_root_hash(&manifest_hash, &interface_hash, wasm_hashes, &payload_root_hash)?;
+    // 11. Root hash (domain-separated; shared with the verifier).
+    let root_hash = caf_core::identity::root_hash(
+        &manifest_hash,
+        &interface_hash,
+        wasm_hashes,
+        &payload_root_hash,
+    )?;
 
     // 12. Write the file.
     let mut out = Vec::new();
@@ -218,25 +225,6 @@ fn collect_capabilities(cfg: &Config) -> Result<Vec<CapabilityId>> {
     Ok(out)
 }
 
-fn compute_root_hash(
-    manifest_hash: &str,
-    interface_hash: &str,
-    wasm_hashes: &[String],
-    payload_root_hash: &str,
-) -> Result<[u8; 32]> {
-    let mut h = Sha256::new();
-    h.update(hex::decode(manifest_hash)?);
-    h.update(hex::decode(interface_hash)?);
-    for w in wasm_hashes {
-        h.update(hex::decode(w)?);
-    }
-    h.update(hex::decode(payload_root_hash)?);
-    let digest = h.finalize();
-    let mut raw = [0u8; 32];
-    raw.copy_from_slice(&digest);
-    Ok(raw)
-}
-
 fn load_interfaces(cfg: &Config, base: &Path) -> Result<Vec<String>> {
     cfg.interfaces
         .iter()
@@ -294,6 +282,7 @@ fn build_components(
         let exports = match (wit.as_ref(), world) {
             (Some(w), Some(world)) => {
                 let world_exports = wit::exports(w, world);
+                check_abi_bridge(&c.name, &blob, &world_exports)?;
                 bind_capabilities(&c.capabilities, &world_exports)?
             }
             _ => exports::extract_exports(&blob),
@@ -347,6 +336,58 @@ fn bind_capabilities(
     Ok(out)
 }
 
+/// caf-abi v1 enforcement: a component that actually exports a WIT function
+/// needing the memory bridge (complex params/results) must export `alloc` and
+/// `dealloc`. Binding is by convention in v1, so matching is name-based
+/// (kebab-case WIT ↔ snake_case wasm); complex WIT functions without a
+/// matching wasm export only warn — they may be intentionally unbound.
+fn check_abi_bridge(
+    component_name: &str,
+    wasm: &[u8],
+    world_exports: &[wit::WorldExport],
+) -> Result<()> {
+    let complex: Vec<&str> = world_exports
+        .iter()
+        .flat_map(|we| we.functions.iter())
+        .filter(|f| f.needs_bridge)
+        .map(|f| f.name.as_str())
+        .collect();
+    if complex.is_empty() {
+        return Ok(());
+    }
+    let wasm_exports: Vec<String> = exports::extract_exports(wasm)
+        .into_iter()
+        .map(|e| e.export.replace('_', "-"))
+        .collect();
+    let bound: Vec<&str> = complex
+        .into_iter()
+        .filter(|f| wasm_exports.iter().any(|e| e == f))
+        .collect();
+    if bound.is_empty() {
+        eprintln!(
+            "warning: component '{component_name}' has complex WIT exports but none match wasm \
+             export names; caf-abi memory-bridge check skipped"
+        );
+        return Ok(());
+    }
+    let has_alloc = wasm_exports.iter().any(|e| e == "alloc");
+    let has_dealloc = wasm_exports.iter().any(|e| e == "dealloc");
+    if !has_alloc || !has_dealloc {
+        let missing = match (has_alloc, has_dealloc) {
+            (false, false) => "alloc and dealloc",
+            (false, true) => "alloc",
+            (true, false) => "dealloc",
+            (true, true) => unreachable!(),
+        };
+        anyhow::bail!(
+            "component '{component_name}' exports complex-typed function(s) [{}] via the caf-abi \
+             memory bridge but is missing {missing} — see doc/spec/caf-abi.md §3",
+            bound.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn collect_payload_blobs(
     node: &PayloadNode,
     base: &Path,
@@ -373,7 +414,8 @@ fn collect_payload_blobs(
 fn sign_manifest(seed_hex: &str, msg: &[u8]) -> Result<([u8; 32], [u8; 64])> {
     use ed25519_dalek::{Signer, SigningKey};
 
-    let seed_bytes = hex::decode(seed_hex).map_err(|e| anyhow::anyhow!("invalid sign.seed: {e}"))?;
+    let seed_bytes =
+        hex::decode(seed_hex).map_err(|e| anyhow::anyhow!("invalid sign.seed: {e}"))?;
     let seed: [u8; 32] = seed_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("sign.seed must be 32 bytes (64 hex chars)"))?;

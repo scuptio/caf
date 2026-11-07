@@ -68,6 +68,8 @@ pub struct ResourceConfig {
     pub memory_max: u64,
     #[serde(default = "default_cpu_fuel")]
     pub cpu_fuel: u64,
+    #[serde(default = "default_read_max")]
+    pub read_max: u64,
     #[serde(default = "default_output_max")]
     pub output_max: u64,
 }
@@ -77,6 +79,7 @@ impl Default for ResourceConfig {
         Self {
             memory_max: default_memory_max(),
             cpu_fuel: default_cpu_fuel(),
+            read_max: default_read_max(),
             output_max: default_output_max(),
         }
     }
@@ -131,6 +134,10 @@ fn default_memory_max() -> u64 {
 
 fn default_cpu_fuel() -> u64 {
     100_000_000
+}
+
+fn default_read_max() -> u64 {
+    1024 * 1024 * 1024
 }
 
 fn default_output_max() -> u64 {

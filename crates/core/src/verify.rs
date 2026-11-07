@@ -1,8 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::hex;
+use crate::identity;
 use crate::layout::{self, TAG_COMPONENT, TAG_MANIFEST, TAG_PAYLOAD, TAG_SIGNATURE};
 use crate::manifest::*;
 use crate::payload;
@@ -17,6 +18,9 @@ pub struct VerifyReport {
     pub capabilities: Vec<CapabilityId>,
     pub signed: bool,
     pub signature_valid: Option<bool>,
+    /// SHA-256 of the embedded ed25519 public key — the signer's fingerprint,
+    /// for comparison against an external trust store.
+    pub signer_fingerprint: Option<String>,
 }
 
 /// Open-time verification: recompute every section hash, the manifest hash, the
@@ -66,10 +70,7 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
     }
 
     // 3. Components.
-    let component_entries: Vec<_> = entries
-        .iter()
-        .filter(|e| e.tag == TAG_COMPONENT)
-        .collect();
+    let component_entries: Vec<_> = entries.iter().filter(|e| e.tag == TAG_COMPONENT).collect();
     if component_entries.len() != manifest.components.len() {
         bail!(
             "component count mismatch: directory {}, manifest {}",
@@ -98,6 +99,13 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
     }
 
     // 4. Payload: file chunk-Merkle hashes + tree structure + access scopes.
+    //    This format version carries exactly one payload tree.
+    if manifest.payloads.len() != 1 {
+        bail!(
+            "expected exactly one payload tree, got {}",
+            manifest.payloads.len()
+        );
+    }
     let payload_root = &manifest.payloads[0].root;
     let mut file_list: Vec<(String, String, u64)> = Vec::new();
     payload::collect_files(payload_root, "", &mut file_list);
@@ -121,7 +129,7 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
             bail!("payload '{path}' directory hash mismatch");
         }
     }
-    verify_tree(payload_root)?;
+    payload::verify_tree(payload_root)?;
     if manifest.hashes.payload.len() != 1 || manifest.hashes.payload[0] != payload_root.hash {
         bail!("payload root hash mismatch");
     }
@@ -137,8 +145,13 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
         }
     }
 
-    // 6. Root hash.
-    let root_hash = compute_root_hash(&manifest_hash, &interface_hash, &wasm_hashes, &payload_root.hash)?;
+    // 6. Root hash (domain-separated, shared with the builder).
+    let root_hash = identity::root_hash(
+        &manifest_hash,
+        &interface_hash,
+        &wasm_hashes,
+        &payload_root.hash,
+    )?;
     if root_hash != header.root_hash {
         bail!("root hash mismatch");
     }
@@ -146,6 +159,7 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
     // 7. Signature (optional).
     let signed = header.flags & layout::FLAG_SIGNED != 0;
     let mut signature_valid = None;
+    let mut signer_fingerprint = None;
     if signed {
         let sig_entry = entries
             .iter()
@@ -153,9 +167,17 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
             .context("signed artifact has no signature directory entry")?;
         let sig_bytes = layout::slice(bytes, sig_entry.offset, sig_entry.length)?;
         if sig_bytes.len() != 96 {
-            bail!("signature section has unexpected length {}", sig_bytes.len());
+            bail!(
+                "signature section has unexpected length {}",
+                sig_bytes.len()
+            );
         }
-        signature_valid = Some(verify_signature(&sig_bytes[..32], &sig_bytes[32..], manifest_bytes));
+        signer_fingerprint = Some(payload::signer_fingerprint(&sig_bytes[..32]));
+        signature_valid = Some(payload::verify_signature(
+            &sig_bytes[..32],
+            &sig_bytes[32..],
+            manifest_bytes,
+        ));
     }
 
     Ok(VerifyReport {
@@ -168,68 +190,8 @@ pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
         capabilities: manifest.capabilities.clone(),
         signed,
         signature_valid,
+        signer_fingerprint,
     })
-}
-
-fn verify_tree(node: &PayloadNode) -> Result<()> {
-    if node.kind == EntryKind::File {
-        return Ok(());
-    }
-    for child in &node.entries {
-        verify_tree(child)?;
-    }
-    let recomputed = dir_hash(&node.entries)?;
-    if recomputed != node.hash {
-        bail!("directory '{}' hash mismatch", node.name);
-    }
-    Ok(())
-}
-
-fn dir_hash(entries: &[PayloadNode]) -> Result<String> {
-    let mut h = Sha256::new();
-    for e in entries {
-        h.update(e.kind.as_str().as_bytes());
-        h.update([0x00]);
-        h.update((e.name.len() as u64).to_le_bytes());
-        h.update(e.name.as_bytes());
-        h.update(hex::decode(&e.hash)?);
-    }
-    Ok(hex::encode(&h.finalize()))
-}
-
-fn compute_root_hash(
-    manifest_hash: &str,
-    interface_hash: &str,
-    wasm_hashes: &[String],
-    payload_root_hash: &str,
-) -> Result<[u8; 32]> {
-    let mut h = Sha256::new();
-    h.update(hex::decode(manifest_hash)?);
-    h.update(hex::decode(interface_hash)?);
-    for w in wasm_hashes {
-        h.update(hex::decode(w)?);
-    }
-    h.update(hex::decode(payload_root_hash)?);
-    let digest = h.finalize();
-    let mut raw = [0u8; 32];
-    raw.copy_from_slice(&digest);
-    Ok(raw)
-}
-
-fn verify_signature(pubkey: &[u8], sig: &[u8], msg: &[u8]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-    let pubkey_arr: Result<[u8; 32], _> = pubkey.try_into();
-    let sig_arr: Result<[u8; 64], _> = sig.try_into();
-    let (Ok(pubkey_arr), Ok(sig_arr)) = (pubkey_arr, sig_arr) else {
-        return false;
-    };
-    let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey_arr) else {
-        return false;
-    };
-    verifying_key
-        .verify(msg, &Signature::from_bytes(&sig_arr))
-        .is_ok()
 }
 
 fn sha256_hex(data: &[u8]) -> String {

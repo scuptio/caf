@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 const TABLE: &[u8; 16] = b"0123456789abcdef";
 

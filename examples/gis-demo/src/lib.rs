@@ -1,52 +1,9 @@
 use serde::Serialize;
 
-// ---------------------------------------------------------------------------
-// Host ABI: a minimal, read-only payload filesystem scoped to the payload
-// root. The host (browser runtime) implements these against the CAF file;
-// the component never sees raw offsets or file formats.
-// ---------------------------------------------------------------------------
-#[link(wasm_import_module = "caf")]
-unsafe extern "C" {
-    fn open(path_ptr: u32, path_len: u32) -> i32;
-    fn read(fd: i32, buf_ptr: u32, buf_len: u32) -> i32;
-    fn close(fd: i32) -> i32;
-    fn readdir(path_ptr: u32, path_len: u32, buf_ptr: u32, buf_len: u32) -> i32;
-}
-
-// ---------------------------------------------------------------------------
-// Memory bridge: the host allocates a buffer in component memory, the
-// component returns results as a packed (ptr | len<<32) value.
-// ---------------------------------------------------------------------------
-#[unsafe(no_mangle)]
-pub extern "C" fn alloc(len: u32) -> u32 {
-    if len == 0 {
-        return 0;
-    }
-    let mut boxed: Box<[u8]> = vec![0u8; len as usize].into_boxed_slice();
-    let ptr = boxed.as_mut_ptr() as u32;
-    std::mem::forget(boxed);
-    ptr
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn dealloc(ptr: u32, len: u32) {
-    if len == 0 || ptr == 0 {
-        return;
-    }
-    unsafe {
-        let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize);
-        let boxed: Box<[u8]> = Box::from_raw(slice as *mut [u8]);
-        drop(boxed);
-    }
-}
-
-fn pack_result(s: String) -> u64 {
-    let boxed: Box<[u8]> = s.into_bytes().into_boxed_slice();
-    let ptr = boxed.as_ptr() as u32;
-    let len = boxed.len() as u32;
-    std::mem::forget(boxed);
-    (ptr as u64) | ((len as u64) << 32)
-}
+// Host ABI, memory bridge (alloc/dealloc), packed results and payload-fs
+// helpers all come from the shared caf-guest crate (the reference
+// implementation of doc/spec/caf-abi.md) — no per-project copies.
+use caf_guest::{list_dir, read_payload, return_str};
 
 fn error_json(msg: String) -> String {
     serde_json::json!({ "error": msg }).to_string()
@@ -79,49 +36,14 @@ enum Coord {
 }
 
 // ---------------------------------------------------------------------------
-// Payload-fs helpers.
+// Payload-fs helpers (thin wrappers over caf-guest, kept for readability).
 // ---------------------------------------------------------------------------
-fn list_dir(path: &str) -> Result<Vec<String>, String> {
-    let mut buf = vec![0u8; 8192];
-    let n = unsafe {
-        readdir(
-            path.as_ptr() as u32,
-            path.len() as u32,
-            buf.as_mut_ptr() as u32,
-            buf.len() as u32,
-        )
-    };
-    if n < 0 {
-        return Err(format!("readdir failed: {path}"));
-    }
-    let s = std::str::from_utf8(&buf[..n as usize]).map_err(|e| e.to_string())?;
-    Ok(s.split('\n')
-        .map(|x| x.trim())
-        .filter(|x| !x.is_empty())
-        .map(|x| x.to_string())
-        .collect())
+fn list_data() -> Result<Vec<String>, String> {
+    list_dir("/data")
 }
 
 fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    let fd = unsafe { open(path.as_ptr() as u32, path.len() as u32) };
-    if fd < 0 {
-        return Err(format!("open failed: {path}"));
-    }
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = unsafe { read(fd, chunk.as_mut_ptr() as u32, chunk.len() as u32) };
-        if n < 0 {
-            unsafe { close(fd) };
-            return Err(format!("read failed: {path}"));
-        }
-        if n == 0 {
-            break;
-        }
-        out.extend_from_slice(&chunk[..n as usize]);
-    }
-    unsafe { close(fd) };
-    Ok(out)
+    read_payload(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -140,13 +62,13 @@ pub extern "C" fn features() -> u64 {
         }
         Err(e) => error_json(e),
     };
-    pack_result(result)
+    return_str(&result)
 }
 
 fn load_features() -> Result<Vec<Feature>, String> {
     let mut features = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for entry in list_dir("/data")? {
+    for entry in list_data()? {
         let path = format!("/data/{entry}");
         let bytes = read_file(&path)?;
         let parsed = if bytes.starts_with(b"WKBSTREAM") {
@@ -184,7 +106,7 @@ pub extern "C" fn features_from_file(name_ptr: u32, name_len: u32) -> u64 {
         }
         Err(e) => error_json(e),
     };
-    pack_result(result)
+    return_str(&result)
 }
 
 fn load_features_from_file(name_ptr: u32, name_len: u32) -> Result<Vec<Feature>, String> {

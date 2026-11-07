@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::hex;
-use crate::manifest::{EntryKind, PayloadLayout, PayloadNode, CHUNK_SIZE};
+use crate::manifest::{CHUNK_SIZE, EntryKind, PayloadLayout, PayloadNode};
 
 /// Build the payload directory tree from a filesystem root. Every file is
 /// content-hashed as a Merkle tree over fixed-size chunks; the tree root is the
@@ -39,8 +39,7 @@ fn build_node(path: &Path) -> Result<PayloadNode> {
             entries,
         })
     } else if meta.is_file() {
-        let data =
-            std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let (hash, chunks) = file_hash(&data)?;
         let layout = if chunks.len() > 1 {
             Some(PayloadLayout::Range)
@@ -85,6 +84,23 @@ pub fn file_hash(data: &[u8]) -> Result<(String, Vec<String>)> {
 pub fn verify_file(data: &[u8]) -> Result<String> {
     let (root, _) = file_hash(data)?;
     Ok(root)
+}
+
+/// SHA-256 of `data`, hex-encoded — the same digest used for chunk hashes.
+pub fn chunk_hash(data: &[u8]) -> String {
+    sha256_hex(data)
+}
+
+/// Number of fixed-size chunks a `length`-byte file is split into.
+pub fn chunk_count(length: u64) -> u64 {
+    length.div_ceil(CHUNK_SIZE as u64)
+}
+
+/// Byte range `[start, end)` of chunk `index` within a `length`-byte file.
+pub fn chunk_range(length: u64, index: u64) -> (u64, u64) {
+    let start = index * CHUNK_SIZE as u64;
+    let end = (start + CHUNK_SIZE as u64).min(length);
+    (start, end)
 }
 
 /// Merkle root over chunk hashes (hex-encoded 32-byte digests). Odd levels pad
@@ -138,6 +154,44 @@ pub fn find<'a>(root: &'a PayloadNode, path: &str) -> Option<&'a PayloadNode> {
         node = node.entries.iter().find(|e| e.name == part)?;
     }
     Some(node)
+}
+
+/// Recompute every directory hash in the tree bottom-up. Structural
+/// consistency only — no payload bytes are involved.
+pub fn verify_tree(node: &PayloadNode) -> Result<()> {
+    if node.kind == EntryKind::File {
+        return Ok(());
+    }
+    for child in &node.entries {
+        verify_tree(child)?;
+    }
+    let recomputed = dir_hash(&node.entries)?;
+    if recomputed != node.hash {
+        bail!("directory '{}' hash mismatch", node.name);
+    }
+    Ok(())
+}
+
+/// Verify an ed25519 `signature` over `msg` with the embedded `pubkey`.
+pub fn verify_signature(pubkey: &[u8], sig: &[u8], msg: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let pubkey_arr: Result<[u8; 32], _> = pubkey.try_into();
+    let sig_arr: Result<[u8; 64], _> = sig.try_into();
+    let (Ok(pubkey_arr), Ok(sig_arr)) = (pubkey_arr, sig_arr) else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey_arr) else {
+        return false;
+    };
+    verifying_key
+        .verify(msg, &Signature::from_bytes(&sig_arr))
+        .is_ok()
+}
+
+/// SHA-256 of the embedded ed25519 public key — the signer's fingerprint.
+pub fn signer_fingerprint(pubkey: &[u8]) -> String {
+    sha256_hex(pubkey)
 }
 
 /// Depth-first listing of `(path, hash, length)` for every file, in the same

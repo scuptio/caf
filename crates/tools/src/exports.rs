@@ -1,4 +1,4 @@
-use crate::manifest::ExportEntry;
+use caf_core::manifest::ExportEntry;
 use wasmparser::{ComponentExternalKind, ExternalKind, Parser, Payload};
 
 /// Extract the export names of a WASM module or component (best-effort). Both

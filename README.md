@@ -49,11 +49,16 @@ expressed entirely through (a) its WIT interface, (b) its WASM components, and
 ```
 caf/
 ├── crates/
-│   └── tools/        # caf-tool: build/inspect .caf artifacts
+│   ├── core/          # caf-core: container format parsing + verification
+│   ├── runtime/       # caf-runtime: WASM host (payload-fs ABI + capability enforcement)
+│   ├── security/      # caf-security: import admission policy + resource metering
+│   ├── guest/         # caf-guest: guest-side helpers (ABI decls, memory bridge, packed results)
+│   └── tools/         # caf-tool: build/verify/inspect/run/ls/diff/keygen + project wizard
 ├── examples/
-│   └── gis-demo/     # a worked example profile (browser demo, no backend)
+│   └── gis-demo/      # a worked example profile (browser demo, no backend)
+├── fuzz/              # cargo-fuzz targets for the parsers and verifier
 └── doc/
-    └── spec/         # container format & ABI specifications
+    └── spec/          # container format, value-encoding ABI specifications
 ```
 
 ## Quick start
@@ -72,8 +77,13 @@ cargo run -p caf-tool -- build -c build.toml -o artifact.caf \
 # Verify a .caf artifact (hash chain, access scopes, signature)
 cargo run -p caf-tool -- verify artifact.caf
 
-# Print a human-readable summary (or full JSON with --json)
-cargo run -p caf-tool -- inspect artifact.caf
+# Inspect / list / diff
+cargo run -p caf-tool -- inspect artifact.caf        # human-readable summary
+cargo run -p caf-tool -- ls artifact.caf             # payload files + components
+cargo run -p caf-tool -- diff a.caf b.caf            # per-section diff
+
+# Execute a component function (host runtime with capability enforcement)
+cargo run -p caf-tool -- run artifact.caf --fn reproject_x --args 120,30,4326,3857
 ```
 
 `caf-tool` compiles the `build.toml` configuration (artifact identity, WIT
@@ -83,6 +93,10 @@ single content-addressed `.caf` file. It validates the WIT interfaces with
 `embed = true` on a component) embeds the world metadata into the module via
 `wit-component`.
 
+`caf-runtime` opens and verifies an artifact, instantiates its WASM components,
+exposes the read-only `payload-fs` ABI scoped to each component's declared
+access, and enforces the deny-by-default capability policy and fuel limits.
+
 For a complete, runnable end-to-end example — including a browser host runtime,
 a WASM component, and a payload in multiple open formats — see
 [`examples/gis-demo`](examples/gis-demo/README.md).
@@ -90,6 +104,9 @@ a WASM component, and a payload in multiple open formats — see
 ## Documentation
 
 - [`doc/spec/container-format.md`](doc/spec/container-format.md) — the `.caf`
-  container format (byte layout, manifest, components, payload, verification).
+  container format (byte layout, manifest, components, payload, incremental
+  verification, trust model, versioning).
+- [`doc/spec/caf-abi.md`](doc/spec/caf-abi.md) — the value-encoding ABI: how
+  complex values cross the host↔component boundary in format v1.
 - [`examples/gis-demo/gis-profile.md`](examples/gis-demo/gis-profile.md) — an example profile
   layered on top of the generic container.

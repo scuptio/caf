@@ -8,3 +8,7 @@ payload/data/global.wkb
 
 # Rust build output
 target/
+
+# e2e
+e2e/node_modules/
+e2e/package-lock.json
