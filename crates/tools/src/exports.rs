@@ -1,3 +1,6 @@
+//! Best-effort export enumeration of WASM modules and components: the fallback
+//! used for the manifest's export list when no WIT world is declared.
+
 use caf_core::manifest::ExportEntry;
 use wasmparser::{ComponentExternalKind, ExternalKind, Parser, Payload};
 

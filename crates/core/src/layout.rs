@@ -1,22 +1,43 @@
+//! Binary section layout of a `.caf` container: the fixed bootstrap header and
+//! the fixed-width section directory (see `doc/spec/container-format.md` §1).
+//!
+//! All integers are little-endian and sections are 8-byte aligned. Because the
+//! manifest carries no offsets and directory entries are fixed-width, the whole
+//! layout is computed in a single forward pass — there is no self-referential
+//! layout to converge on.
+
 use anyhow::{Context, Result, bail};
 
+/// File magic at offset 0, identifying a `.caf` artifact.
 pub const MAGIC: [u8; 4] = *b"CAF\0";
+/// Size of the fixed bootstrap header in bytes.
 pub const HEADER_SIZE: u64 = 92;
+/// Header flag: the artifact carries an ed25519 signature section.
 pub const FLAG_SIGNED: u16 = 0x0001;
 
 // Directory entry tags (single binary TOC, fixed-width entries).
+/// Directory entry tag for a WASM component section.
 pub const TAG_COMPONENT: u8 = 0;
+/// Directory entry tag for a payload file section.
 pub const TAG_PAYLOAD: u8 = 1;
+/// Directory entry tag for the manifest section.
 pub const TAG_MANIFEST: u8 = 2;
+/// Directory entry tag for the signature section.
 pub const TAG_SIGNATURE: u8 = 3;
 
 /// Fixed-width directory entry: `tag u8` + `offset u64` + `length u64` + `hash [u8;32]`.
 pub const DIRECTORY_ENTRY_SIZE: usize = 1 + 8 + 8 + 32;
 
+/// One section-directory entry: a typed `(offset, length, hash)` pointer into
+/// the artifact.
 pub struct DirectoryEntry {
+    /// Section kind (`TAG_*`).
     pub tag: u8,
+    /// Absolute byte offset of the section.
     pub offset: u64,
+    /// Byte length of the section.
     pub length: u64,
+    /// SHA-256 of the section bytes.
     pub hash: [u8; 32],
 }
 
@@ -24,17 +45,28 @@ pub struct DirectoryEntry {
 /// manifest carries no offsets and the directory is fixed-width, so neither
 /// section's size depends on the values of the offsets it would contain.
 pub struct Layout {
+    /// Offset of the manifest section.
     pub manifest_offset: u64,
+    /// Byte length of the manifest section.
     pub manifest_len: u64,
+    /// Offset of the interface (WIT text) section.
     pub interface_offset: u64,
+    /// Byte length of the interface section.
     pub interface_len: u64,
+    /// Offset of the section directory.
     pub directory_offset: u64,
+    /// Byte length of the section directory.
     pub directory_len: u64,
+    /// Offset of each WASM component, in manifest order.
     pub component_offsets: Vec<u64>,
+    /// Offset of each payload file, in deterministic DFS order.
     pub file_offsets: Vec<u64>,
+    /// Offset of the 96-byte signature section (`0` when unsigned).
     pub signature_offset: u64,
 }
 
+/// Compute the full section layout in a single forward pass, 8-byte aligning
+/// every section. `signed` reserves room for the signature section at the end.
 pub fn compute(
     manifest_len: u64,
     interface_len: u64,
@@ -78,10 +110,14 @@ pub fn compute(
     }
 }
 
+/// Round `v` up to the next multiple of `align` (a power of two).
 pub fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
+/// Serialize the 92-byte bootstrap header: magic, format version, header size,
+/// flags, the manifest/interface/directory offsets and lengths, and the
+/// artifact root hash.
 pub fn write_header(
     out: &mut Vec<u8>,
     layout: &Layout,
@@ -102,6 +138,8 @@ pub fn write_header(
     out.extend_from_slice(root_hash);
 }
 
+/// Serialize the section directory: a `u32` entry count followed by
+/// fixed-width entries.
 pub fn encode_directory(entries: &[DirectoryEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + entries.len() * DIRECTORY_ENTRY_SIZE);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -114,6 +152,8 @@ pub fn encode_directory(entries: &[DirectoryEntry]) -> Vec<u8> {
     out
 }
 
+/// Parse a section directory produced by [`encode_directory`], rejecting
+/// truncated input and entry counts whose size would overflow.
 pub fn decode_directory(bytes: &[u8]) -> Result<Vec<DirectoryEntry>> {
     let count = le_u32(bytes.get(0..4).context("directory too short")?)? as usize;
     let expected = 4usize
@@ -160,18 +200,30 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<DirectoryEntry>> {
     Ok(entries)
 }
 
+/// The parsed 92-byte bootstrap header.
 pub struct Header {
+    /// Container format version (must match the manifest's).
     pub format_version: u32,
+    /// Header flags (`FLAG_*`).
     pub flags: u16,
+    /// Offset of the manifest section.
     pub manifest_offset: u64,
+    /// Byte length of the manifest section.
     pub manifest_len: u64,
+    /// Offset of the interface (WIT text) section.
     pub interface_offset: u64,
+    /// Byte length of the interface section.
     pub interface_len: u64,
+    /// Offset of the section directory.
     pub directory_offset: u64,
+    /// Byte length of the section directory.
     pub directory_len: u64,
+    /// Domain-separated artifact root hash (see [`crate::identity`]).
     pub root_hash: [u8; 32],
 }
 
+/// Parse and validate the bootstrap header (magic, declared header size) from
+/// the start of the artifact.
 pub fn read_header(bytes: &[u8]) -> Result<Header> {
     if bytes.len() < HEADER_SIZE as usize {
         bail!("file too small for a CAF header");

@@ -1,7 +1,14 @@
+//! Lowercase hexadecimal encoding and decoding.
+//!
+//! Every hash in the container format (manifest, directory entries, payload
+//! tree) is stored as a hex string, so this is the canonical text
+//! representation of 32-byte SHA-256 digests throughout the crate.
+
 use anyhow::{Result, bail};
 
 const TABLE: &[u8; 16] = b"0123456789abcdef";
 
+/// Hex-encode `bytes` (lowercase, no separators or `0x` prefix).
 pub fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -11,6 +18,7 @@ pub fn encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode a hex string, rejecting odd lengths and non-hex digits.
 pub fn decode(s: &str) -> Result<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {

@@ -17,16 +17,21 @@ use caf_core::manifest::{CapabilityPolicy, ExecutionProfile, ResourceLimits};
 /// Host function groups of the `caf` ABI, classified by the capability they
 /// require. Anything outside these two groups is undeclared and rejected.
 pub const PAYLOAD_FS_FUNCS: &[&str] = &["open", "read", "readdir", "stat", "seek", "close"];
+/// Meta host functions (introspection, output, abort) available to every
+/// component regardless of policy.
 pub const META_FUNCS: &[&str] = &["self_size", "emit", "log", "abort"];
 
 /// A single import requested by a component (module + name).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Import {
+    /// Import module; only `caf` (the host ABI) is declared.
     pub module: String,
+    /// Import name within the module.
     pub name: String,
 }
 
 impl Import {
+    /// Build an import from its module and name.
     pub fn new(module: &str, name: &str) -> Self {
         Self {
             module: module.to_string(),
@@ -49,9 +54,17 @@ pub enum AdmissionError {
     /// Declared-but-unsupported is a hard error, not a silent no-op.
     UnsupportedCapability(&'static str),
     /// The component imports something outside the `caf` host ABI.
-    UndeclaredImport { module: String, name: String },
+    UndeclaredImport {
+        /// Import module.
+        module: String,
+        /// Import name.
+        name: String,
+    },
     /// The component imports a payload-fs function but `self_read` is false.
-    CapabilityNotGranted { name: String },
+    CapabilityNotGranted {
+        /// The `caf.*` function imported without the grant.
+        name: String,
+    },
     /// The manifest names an execution profile this runtime cannot enforce.
     /// Profiles are machine-checkable configuration sets; an unknown one is a
     /// dead declaration, so it is rejected rather than silently ignored.
@@ -171,9 +184,13 @@ pub fn resolve_imports(
 /// Declared resource budgets (the protocol-level, deterministic budget).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budgets {
+    /// Maximum guest linear memory, in bytes.
     pub memory_max: u64,
+    /// CPU budget, in fuel units.
     pub fuel_max: u64,
+    /// Maximum bytes fetched from the payload backing store.
     pub read_max: u64,
+    /// Maximum bytes of output (emit/log, results, host memory reads).
     pub output_max: u64,
 }
 
@@ -202,6 +219,7 @@ pub struct Meter {
 }
 
 impl Meter {
+    /// A meter with zero usage against `budgets`.
     pub fn new(budgets: Budgets) -> Self {
         Self {
             budgets,
@@ -220,14 +238,17 @@ impl Meter {
         charge(&mut self.output_used, self.budgets.output_max, n)
     }
 
+    /// The budgets this meter enforces.
     pub fn budgets(&self) -> Budgets {
         self.budgets
     }
 
+    /// Bytes charged against the read budget so far.
     pub fn read_used(&self) -> u64 {
         self.read_used
     }
 
+    /// Bytes charged against the output budget so far.
     pub fn output_used(&self) -> u64 {
         self.output_used
     }

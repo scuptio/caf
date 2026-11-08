@@ -1,3 +1,7 @@
+//! The `build.toml` schema and its loading: artifact identity, interfaces,
+//! payload root, execution profile, resource limits, capability policy,
+//! signing, and components — with defaults matching the format's v1 profile.
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};

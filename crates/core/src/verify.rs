@@ -1,3 +1,7 @@
+//! Full open-time verification of a `.caf` artifact: every section hash, the
+//! manifest hash, the domain-separated root hash, access-scope bindings, and
+//! the optional ed25519 signature (see `doc/spec/container-format.md`).
+
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -8,15 +12,25 @@ use crate::layout::{self, TAG_COMPONENT, TAG_MANIFEST, TAG_PAYLOAD, TAG_SIGNATUR
 use crate::manifest::*;
 use crate::payload;
 
+/// Summary of a successful verification, for display by `caf-tool verify`.
 pub struct VerifyReport {
+    /// Artifact name from the manifest.
     pub name: String,
+    /// Artifact version from the manifest.
     pub version: String,
+    /// Domain-separated root hash (hex) — the artifact's content identity.
     pub root_hash: String,
+    /// SHA-256 (hex) of the manifest bytes.
     pub manifest_hash: String,
+    /// Number of embedded WASM components.
     pub components: usize,
+    /// Number of payload files.
     pub payload_files: usize,
+    /// Capabilities the artifact exposes.
     pub capabilities: Vec<CapabilityId>,
+    /// Whether the artifact carries a signature section.
     pub signed: bool,
+    /// Signature validity (`None` when the artifact is unsigned).
     pub signature_valid: Option<bool>,
     /// SHA-256 of the embedded ed25519 public key — the signer's fingerprint,
     /// for comparison against an external trust store.
@@ -30,6 +44,8 @@ pub fn verify(path: &Path) -> Result<VerifyReport> {
     verify_bytes(&bytes)
 }
 
+/// In-memory equivalent of [`verify`]: verify artifact bytes already loaded
+/// (or received) by the caller.
 pub fn verify_bytes(bytes: &[u8]) -> Result<VerifyReport> {
     let header = layout::read_header(bytes)?;
 

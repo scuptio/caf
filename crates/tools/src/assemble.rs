@@ -1,3 +1,8 @@
+//! Assemble a `.caf` artifact from a build [`Config`]: hash the interface, build
+//! the payload Merkle tree, bind components (access scopes + capability-bound
+//! exports), compute layout and directory, derive the root hash, and optionally
+//! sign the manifest.
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

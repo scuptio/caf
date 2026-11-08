@@ -49,6 +49,7 @@ pub struct SliceSource {
 }
 
 impl SliceSource {
+    /// Wrap in-memory artifact bytes as a [`PayloadSource`].
     pub fn new(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }
@@ -72,6 +73,7 @@ pub struct FileSource {
 }
 
 impl FileSource {
+    /// Open a local `.caf` file for lazy, positional reads.
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let len = file.metadata()?.len();
@@ -316,22 +318,27 @@ impl Artifact {
         })
     }
 
+    /// Artifact name from the manifest.
     pub fn name(&self) -> &str {
         &self.manifest.name
     }
 
+    /// Artifact version from the manifest.
     pub fn version(&self) -> &str {
         &self.manifest.version
     }
 
+    /// Hex-encoded root hash — the artifact's content identity.
     pub fn root_hash(&self) -> String {
         hex::encode(&self.header.root_hash)
     }
 
+    /// The components embedded in the artifact.
     pub fn components(&self) -> &[manifest::ComponentRef] {
         &self.manifest.components
     }
 
+    /// Capabilities the artifact exposes.
     pub fn capabilities(&self) -> &[manifest::CapabilityId] {
         &self.manifest.capabilities
     }
@@ -839,7 +846,9 @@ pub struct Session {
 
 /// Metered consumption so far in this session `(read_bytes, output_bytes)`.
 pub struct Usage {
+    /// Bytes fetched from the payload backing store.
     pub read: u64,
+    /// Bytes emitted as output (emit/log, results, host memory reads).
     pub output: u64,
 }
 

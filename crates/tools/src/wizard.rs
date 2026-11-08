@@ -1,3 +1,6 @@
+//! `caf-tool new`: scaffold a new CAF project (build config, WIT interface, and
+//! a language skeleton) from askama templates.
+
 use anyhow::{Context, Result, bail};
 use askama::Template;
 use clap::ValueEnum;

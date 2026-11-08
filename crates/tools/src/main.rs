@@ -1,3 +1,12 @@
+//! `caf-tool`: command-line tool to build, verify, inspect, diff, and execute
+//! `.caf` artifacts (see `doc/spec/container-format.md`).
+//!
+//! Subcommands: `build` assembles an artifact from a `build.toml`; `verify`
+//! checks the hash chain, access scopes, and signature against an optional
+//! trust store; `keygen` generates ed25519 signing keys; `inspect`, `ls`, and
+//! `diff` examine artifacts; `run` executes a component function through
+//! `caf-runtime`; `new` scaffolds a fresh CAF project.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;

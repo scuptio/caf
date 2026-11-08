@@ -1,3 +1,7 @@
+//! WIT handling for the build: parse interface files into one `Resolve`, select
+//! a component's world, list capability-bindable exports, and embed
+//! component-type metadata into modules.
+
 use anyhow::{Context, Result};
 use wit_component::StringEncoding;
 use wit_parser::{Function, InterfaceId, PackageId, Resolve, WorldId, WorldItem, WorldKey};

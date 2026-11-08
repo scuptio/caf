@@ -1,3 +1,7 @@
+//! `caf-tool run`: parse CLI arguments into wasm values, call a component
+//! export through `caf-runtime`, and print the results (decoding packed
+//! `(ptr | len << 32)` string results unless `--raw`).
+
 use std::path::Path;
 use std::sync::Arc;
 
