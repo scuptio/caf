@@ -1,0 +1,136 @@
+# Root cargo-make orchestration for the CAF workspace.
+#
+# Discover commands and their descriptions:
+#   cargo make help                        # this repo's tasks, grouped and colored
+#   cargo make --list-all-steps            # raw listing incl. cargo-make built-ins
+#   cargo make --list-category-steps Check # filter by category
+#
+# Common entry points:
+#   cargo make            # = cargo make build
+#   cargo make build      # release build of the whole workspace (compile only)
+#   cargo make check      # fmt + clippy + test compilation (split into check-* steps)
+#   cargo make test       # cargo test --workspace
+#   cargo make doctor     # probe the dev toolchain; `-- install` adds the missing ones
+
+# Don't load cargo-make's built-in core flows (build/test/CI/publish stubs):
+# every task below is defined explicitly, and skipping the core tasks keeps
+# `cargo make --list-all-steps` free of ~60 unrelated built-in entries.
+[config]
+skip_core_tasks = true
+# The repository root is a plain cargo workspace, not per-member builds: run
+# every task once at the root instead of fanning out to each member crate.
+default_to_workspace = false
+
+[env]
+REPO_ROOT = "${CARGO_MAKE_WORKING_DIRECTORY}"
+# One Python interpreter for every task invoking a script; Windows overrides
+# the default command name below.
+PYTHON = { value = "python3", condition = { env_not_set = ["PYTHON"] } }
+
+[env.windows]
+PYTHON = { value = "python", condition = { env_not_set = ["PYTHON"] } }
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+[tasks.build]
+clear = true
+description = "Release-build the whole workspace (compile only)"
+category = "Build"
+command = "cargo"
+args = ["build", "--release", "--workspace"]
+cwd = "${REPO_ROOT}"
+
+[tasks.build-dev]
+description = "Debug-build the whole workspace"
+category = "Build"
+command = "cargo"
+args = ["build", "--workspace"]
+cwd = "${REPO_ROOT}"
+
+[tasks.default]
+clear = true
+description = "Default flow: alias for build"
+category = "Build"
+alias = "build"
+
+# ---------------------------------------------------------------------------
+# check / test
+# ---------------------------------------------------------------------------
+
+# fmt --check + clippy (-D warnings) + test compilation across the workspace.
+# Split into per-step tasks below (check-fmt, check-clippy, check-test-compile).
+[tasks.check]
+clear = true
+description = "Format, lint, and compile-check the workspace (see check-* steps)"
+category = "Check"
+dependencies = ["check-fmt", "check-clippy", "check-test-compile"]
+
+[tasks.check-fmt]
+description = "cargo fmt --check across the workspace"
+category = "Check"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "${REPO_ROOT}"
+
+[tasks.check-clippy]
+description = "cargo clippy --workspace --all-targets -D warnings"
+category = "Check"
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+cwd = "${REPO_ROOT}"
+
+[tasks.check-test-compile]
+description = "cargo test --no-run across the workspace"
+category = "Check"
+command = "cargo"
+args = ["test", "--workspace", "--no-run"]
+cwd = "${REPO_ROOT}"
+
+[tasks.test]
+clear = true
+description = "Run cargo test --workspace"
+category = "Test"
+command = "cargo"
+args = ["test", "--workspace"]
+cwd = "${REPO_ROOT}"
+
+# ---------------------------------------------------------------------------
+# misc
+# ---------------------------------------------------------------------------
+
+[tasks.doc]
+description = "Build API documentation (cargo doc --workspace --no-deps)"
+category = "Utility"
+command = "cargo"
+args = ["doc", "--workspace", "--no-deps"]
+cwd = "${REPO_ROOT}"
+
+[tasks.clean]
+clear = true
+description = "Clean the target/ directory"
+category = "Utility"
+command = "cargo"
+args = ["clean"]
+cwd = "${REPO_ROOT}"
+
+# Pretty, grouped list of this repository's tasks. `--list-all-steps` shows
+# the raw listing (only hook stubs remain, since core tasks are skipped above).
+[tasks.help]
+description = "List this repository's cargo-make tasks, grouped and colored"
+category = "Utility"
+command = "${PYTHON}"
+args = ["${REPO_ROOT}/script/show_tasks.py"]
+cwd = "${REPO_ROOT}"
+
+# Probe the toolchain and report what each tool unlocks (the gis-demo wasm
+# build, web demo tests, fuzz targets).
+# `cargo make doctor -- install [--dry-run]` installs the missing user-level
+# tools (rustup/cargo recipes only; never sudo).
+[tasks.doctor]
+description = "Probe the dev toolchain; `cargo make doctor -- install` installs missing user-level tools"
+category = "Utility"
+command = "${PYTHON}"
+args = ["${REPO_ROOT}/script/doctor.py", "${@}"]
+cwd = "${REPO_ROOT}"
