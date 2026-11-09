@@ -24,9 +24,25 @@ pub struct Config {
     #[serde(default)]
     pub sign: Option<SignConfig>,
     #[serde(default)]
+    pub encrypt: Option<EncryptConfig>,
+    #[serde(default)]
     pub components: Vec<ComponentConfig>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+/// `[encrypt]`: seal the artifact (components, payload, private manifest).
+#[derive(Deserialize)]
+pub struct EncryptConfig {
+    /// P-256 recipient public keys (uncompressed SEC-1, hex). One anonymous
+    /// keybox stanza is emitted per recipient.
+    pub recipients: Vec<String>,
+    /// Optional 32-byte seed (hex) for **convergent** builds: the content key
+    /// and keybox ephemerals are derived from the seed and the plaintext
+    /// identity, so identical inputs reproduce identical ciphertext. Omit it
+    /// for a fresh random content key per build.
+    #[serde(default)]
+    pub key_seed: Option<String>,
 }
 
 #[derive(Deserialize)]

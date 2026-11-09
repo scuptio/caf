@@ -14,6 +14,13 @@ pub const MAGIC: [u8; 4] = *b"CAF\0";
 pub const HEADER_SIZE: u64 = 92;
 /// Header flag: the artifact carries an ed25519 signature section.
 pub const FLAG_SIGNED: u16 = 0x0001;
+/// Header flag: components, payload and the private manifest are encrypted
+/// (see `crate::crypto`); the manifest section then holds the public envelope.
+pub const FLAG_ENCRYPTED: u16 = 0x0002;
+/// Mask of every defined header flag. Readers reject unknown flag bits
+/// (fail-closed), so a future flag such as an encryption marker can never be
+/// silently ignored by an old reader serving ciphertext as plaintext.
+pub const KNOWN_FLAGS: u16 = FLAG_SIGNED | FLAG_ENCRYPTED;
 
 // Directory entry tags (single binary TOC, fixed-width entries).
 /// Directory entry tag for a WASM component section.
@@ -24,6 +31,19 @@ pub const TAG_PAYLOAD: u8 = 1;
 pub const TAG_MANIFEST: u8 = 2;
 /// Directory entry tag for the signature section.
 pub const TAG_SIGNATURE: u8 = 3;
+/// Directory entry tag for the keybox section (encrypted artifacts).
+pub const TAG_KEYBOX: u8 = 4;
+/// Directory entry tag for the encrypted private-manifest section.
+pub const TAG_PRIVATE: u8 = 5;
+/// Every tag a v1 reader understands; unknown tags are rejected (fail-closed).
+pub const KNOWN_TAGS: [u8; 6] = [
+    TAG_COMPONENT,
+    TAG_PAYLOAD,
+    TAG_MANIFEST,
+    TAG_SIGNATURE,
+    TAG_KEYBOX,
+    TAG_PRIVATE,
+];
 
 /// Fixed-width directory entry: `tag u8` + `offset u64` + `length u64` + `hash [u8;32]`.
 pub const DIRECTORY_ENTRY_SIZE: usize = 1 + 8 + 8 + 32;
@@ -57,6 +77,12 @@ pub struct Layout {
     pub directory_offset: u64,
     /// Byte length of the section directory.
     pub directory_len: u64,
+    /// Offset of the keybox section (sealed artifacts; `0` when absent).
+    pub keybox_offset: u64,
+    /// Offset of the encrypted private-manifest section (sealed; `0` when absent).
+    pub private_offset: u64,
+    /// Byte length of the encrypted private-manifest section (sealed; `0` when absent).
+    pub private_len: u64,
     /// Offset of each WASM component, in manifest order.
     pub component_offsets: Vec<u64>,
     /// Offset of each payload file, in deterministic DFS order.
@@ -66,7 +92,9 @@ pub struct Layout {
 }
 
 /// Compute the full section layout in a single forward pass, 8-byte aligning
-/// every section. `signed` reserves room for the signature section at the end.
+/// every section. `signed` reserves room for the signature section at the end;
+/// `sealed` reserves the keybox and private-manifest sections (in that order)
+/// right after the directory.
 pub fn compute(
     manifest_len: u64,
     interface_len: u64,
@@ -74,6 +102,7 @@ pub fn compute(
     component_lens: &[u64],
     file_lens: &[u64],
     signed: bool,
+    sealed: Option<(u64, u64)>,
 ) -> Layout {
     let mut cursor = align_up(HEADER_SIZE, 8);
     let manifest_offset = cursor;
@@ -82,6 +111,17 @@ pub fn compute(
     cursor = align_up(cursor + interface_len, 8);
     let directory_offset = cursor;
     cursor = align_up(cursor + directory_len, 8);
+
+    let (keybox_offset, private_offset, private_len) = match sealed {
+        Some((keybox_len, private_len)) => {
+            let keybox_offset = cursor;
+            cursor = align_up(cursor + keybox_len, 8);
+            let private_offset = cursor;
+            cursor = align_up(cursor + private_len, 8);
+            (keybox_offset, private_offset, private_len)
+        }
+        None => (0, 0, 0),
+    };
 
     let mut component_offsets = Vec::with_capacity(component_lens.len());
     for len in component_lens {
@@ -104,6 +144,9 @@ pub fn compute(
         interface_len,
         directory_offset,
         directory_len,
+        keybox_offset,
+        private_offset,
+        private_len,
         component_offsets,
         file_offsets,
         signature_offset,
@@ -173,6 +216,9 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<DirectoryEntry>> {
     let mut pos = 4usize;
     for _ in 0..count {
         let tag = bytes[pos];
+        if !KNOWN_TAGS.contains(&tag) {
+            bail!("unknown directory entry tag {tag}");
+        }
         let offset = le_u64(
             bytes
                 .get(pos + 1..pos + 9)
@@ -234,6 +280,9 @@ pub fn read_header(bytes: &[u8]) -> Result<Header> {
     let format_version = le_u32(bytes.get(4..8).context("header truncated")?)?;
     let header_size = le_u16(bytes.get(8..10).context("header truncated")?)?;
     let flags = le_u16(bytes.get(10..12).context("header truncated")?)?;
+    if flags & !KNOWN_FLAGS != 0 {
+        bail!("unknown header flags 0x{flags:04x} (known mask 0x{KNOWN_FLAGS:04x})");
+    }
     if header_size != HEADER_SIZE as u16 {
         bail!("unsupported header size {header_size}");
     }

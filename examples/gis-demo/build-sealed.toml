@@ -1,0 +1,31 @@
+# Sealed variant of build.toml: same artifact, encrypted (spec §8).
+#
+# DEMO KEY MATERIAL — public on purpose. The demo demonstrates the *mechanism*
+# (envelope/private manifest split, keybox, AEAD chunks, pow2 padding), not
+# secrecy: the recipient secret and key seed are committed to the repo.
+name = "global-countries"
+version = "0.1.0"
+
+interfaces = ["interfaces/gis.wit"]
+
+[payload]
+root = "payload"
+media_type = "application/x-spatial-demo"
+
+# `features()` parses ~20 MB of JSON + WKB, so give it a generous fuel budget.
+[resources]
+cpu_fuel = 50_000_000_000
+
+# Convergent build (key_seed set): identical inputs reproduce identical
+# ciphertext, and caf-tool prints the content key so the web demo can open the
+# artifact (build.sh writes it to web/sealed-key.js).
+[encrypt]
+recipients = ["04740ad157fd924f089970cf52b83472148b654cf1f9ce98a36a6d5fbefa1e157b225aa452ba27dd0804f0fb8817811d2eca8d69283e5701b696242d914a5b4100"]
+key_seed = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[[components]]
+name = "projection"
+world = "projection"
+path = "gis-demo.wasm"
+capabilities = ["cf:spatial-transform@1"]
+access = ["/data"]

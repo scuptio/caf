@@ -53,11 +53,42 @@ file. Sections are 8-byte aligned.
 +-----------------------------------+
 ```
 
+A sealed artifact (`FLAG_ENCRYPTED`, §8) inserts two sections right after the
+directory — the **keybox** (recipient stanzas) and the encrypted **private
+manifest** — and stores a single encrypted **payload blob** instead of
+per-file payload sections:
+
+```text
+| Section Directory (binary TOC)    |
++-----------------------------------+
+| Keybox           (plaintext)      |
++-----------------------------------+
+| Private Manifest (ciphertext)     |
++-----------------------------------+
+| WASM components  (ciphertext)     |
++-----------------------------------+
+| Payload blob     (ciphertext)     |
++-----------------------------------+
+```
+
+`Flags` is a `u16` bitfield. v1 defines two bits: `0x0001 SIGNED` — the
+artifact carries a 96-byte ed25519 signature section — and `0x0002 ENCRYPTED`
+— the artifact is sealed (§8). Readers **must reject an artifact carrying any
+unknown flag bit** (fail-closed): a reader that silently ignored a future flag
+— e.g. an encryption marker — would serve ciphertext as plaintext. New flags
+are therefore only ever introduced together with a `format_version` major bump
+(§12).
+
+Directory entry tags: `0` WASM component · `1` payload (file section, or the
+single payload blob in a sealed artifact) · `2` manifest (the envelope manifest
+in a sealed artifact) · `3` signature · `4` keybox · `5` private manifest.
+Readers reject unknown tags (fail-closed).
+
 The **bootstrap header** is the only part that must be read eagerly (a few dozen
 bytes); manifest, interface, and directory are the "boot area" read on open (a
 few KB); payload and WASM components are read on demand by offset + HTTP Range.
 A remote artifact is thus opened after reading only the boot area plus the
-(small) component bytes — see §10 for the incremental-verification contract
+(small) component bytes — see §11 for the incremental-verification contract
 that makes this sound.
 
 The **section directory** is a fixed-width binary table (not CBOR): a `u32` entry
@@ -69,7 +100,10 @@ there is no self-referential layout to converge.
 ## 2. Manifest
 
 The manifest is the artifact's self-description ("DNA"). It is serialized as
-**canonical CBOR** and is domain-agnostic — no profile-specific fields.
+**canonical CBOR** and is domain-agnostic — no profile-specific fields. In a
+sealed artifact (`FLAG_ENCRYPTED`) the manifest section instead carries the
+public **envelope** and the full manifest moves into the encrypted **private
+manifest** — see §8; everything below describes the plaintext form.
 
 ```rust
 struct Manifest {
@@ -277,6 +311,9 @@ struct PayloadNode {
   component cannot interpret. Chunk-aligned compression is a v2 topic.
 - **one tree in v1**: this format version carries exactly one payload tree;
   the root-hash construction (§7) already leaves room for more.
+- **sealed payloads**: in a sealed artifact the per-file sections are replaced
+  by a single encrypted, pow2-padded payload blob, and the tree (with real
+  lengths and plaintext hashes) moves into the private manifest — see §8.
 
 ## 6. Execution profile & resource limits
 
@@ -340,10 +377,14 @@ The manifest stores the interface/wasm/payload hashes (of the *other* sections);
 its own hash and the root hash are derived and stored outside the manifest (root
 in the header, manifest hash in the directory), so the manifest is free of
 self-referential hashes and `SHA256(manifest)` always equals the stored
-`ManifestHash`.
+`ManifestHash`. In a sealed artifact (§8) every section hash covers the *stored*
+bytes — ciphertext — so the root hash is the ciphertext identity.
 
-Signatures are ed25519 over the canonical manifest bytes (which in turn cover all
-section hashes). Provenance distinguishes **data** / **algorithm** / **artifact**
+Signatures are ed25519 over the 32-byte **root hash**, which transitively covers
+every section. For sealed artifacts this is Encrypt-then-Sign: the signature
+binds the ciphertext identity and verifies without the content key; the
+signature section stays plaintext.
+Provenance distinguishes **data** / **algorithm** / **artifact**
 publishers.
 
 ### 7.1 Trust model
@@ -371,7 +412,89 @@ established out of band:
 
 Multiple signers and certificate chains are v2 topics.
 
-## 8. Result verification
+## 8. Sealed artifacts (encryption)
+
+A sealed artifact (`FLAG_ENCRYPTED`) encrypts the components, the payload, and
+a **private manifest**, leaving only a minimal public **envelope** in the
+manifest section. The design hides file names, directory structure, real file
+lengths, component metadata, provenance, and artifact name/version; it does
+not hide the number of components, the capabilities offered, or the padded
+total payload size.
+
+```text
+content key (32 B, random per build — or convergent, see below)
+  ├─ section key "private"      → AES-256-GCM encrypts the private manifest
+  ├─ section key "component/<i>" → AES-256-GCM encrypts each component
+  └─ section key "payload"      → AES-256-GCM encrypts the payload blob
+                                    per 1 MiB chunk
+```
+
+- **KDF**: `KDF(label, ikm) = SHA-256("CAF-KDF-1" ‖ 0x00 ‖ label ‖ 0x00 ‖ ikm)`.
+  Section keys are `KDF("section", content_key ‖ label)`. This plain
+  hash-KDF is sound here because every IKM is a uniformly random 32-byte
+  value (a fresh content key or an ECDH shared secret) — it is *not* a
+  password KDF.
+- **Chunk nonces**: per-section sub-keys make nonces section-local, so chunk
+  `i` uses the nonce `0x00000000 ‖ u64be(i)` — a counter, never random.
+- **Keybox**: a `u32` stanza count followed by fixed-width **anonymous**
+  stanzas (125 B each): `ephemeral_pubkey (65 B, uncompressed SEC-1) ‖
+  nonce (12 B) ‖ wrapped_key (48 B)`. Each stanza wraps the content key with
+  `p256-ecdh-sha256`: ECDH between the ephemeral key and the recipient's P-256
+  key, `KDF("keywrap", shared)`, AES-256-GCM. No recipient key id is stored,
+  so the keybox does not reveal *who* the recipients are; a recipient tries
+  every stanza.
+- **Envelope manifest** (public, CBOR, still the `TAG_MANIFEST` section):
+  `format_version`, interface ref, capabilities, execution profile, resource
+  limits, policy, the `encryption` block (`aead` / `wrap` / `padding`
+  algorithm ids), anonymous ciphertext refs for the components, and refs for
+  the keybox / private / payload sections. Everything else moves into the
+  private manifest.
+- **Private manifest** (encrypted, CBOR, `TAG_PRIVATE`): artifact name and
+  version, provenance, per-component metadata (names, worlds, plaintext
+  hashes, exports, access scopes), and the payload tree.
+- **Payload blob**: all payload files concatenated in DFS order, zero-padded
+  to the **next power of two** (4 KiB floor; `padding: "pow2"`), split into
+  1 MiB chunks, each chunk sealed with the payload section key. The private
+  manifest's payload ref carries the real length, the padded length, and the
+  global ciphertext-chunk hash list; per-file plaintext hashes stay in the
+  tree. Publicly the directory leaks only the padded blob size — not the file
+  count or individual sizes.
+- **Reads**: a host decrypts the private manifest at open, then serves payload
+  reads by fetching each covering ciphertext chunk, hash-checking it against
+  the private manifest's chunk list, and only then decrypting (AEAD) and
+  handing plaintext to the guest. Verification-before-use is unchanged; the
+  guest ABI is untouched.
+- **Verification tiers**: without a key, `caf-tool verify` checks every stored
+  hash and the signature (public tier) and reports the artifact as sealed.
+  With `--key` / `--recipient-key` it additionally decrypts and verifies the
+  private manifest, plaintext component hashes, and per-file payload hashes
+  (plaintext tier).
+- **Convergent builds**: `caf-tool build` normally draws a fresh random
+  content key, so two builds of identical input differ. Setting
+  `[encrypt] key_seed` derives the content key from the seed plus the
+  plaintext identity (interface, component, and payload-tree hashes) and the
+  keybox ephemerals deterministically, making builds byte-reproducible.
+  Rotate the seed only with intent: convergence is what makes rebuilds
+  comparable.
+
+### 8.1 Fetch modes and access patterns
+
+Sealed artifacts protect **content at rest**, not **access patterns**. A host
+that fetches ciphertext chunks on demand reveals *which* chunks are read.
+Deployments choose one of two modes:
+
+- **Whole-file fetch** — download the artifact once, then read locally; no
+  access-pattern leakage beyond "the artifact was fetched". This is the
+  required mode for JS hosts opening sealed artifacts (WebCrypto decryption
+  happens at open) and the recommended mode whenever access patterns are
+  sensitive.
+- **Range fetch** — lazily fetch ciphertext chunks (§11); leaks the chunk
+  access pattern to the backing store, but scales to huge artifacts.
+
+Padding (`pow2`) bounds the *static* size leak; neither padding nor encryption
+hides the *dynamic* access pattern in range-fetch mode.
+
+## 9. Result verification
 
 ```text
 ResultID = H(FileId, FunctionId, CanonicalArgs, ExecutionProfile)
@@ -381,7 +504,7 @@ A deterministic run produces a **verifiable computational claim**: different
 parties using the same file + function + args + profile obtain the same
 `ResultID`.
 
-## 9. Profiles
+## 10. Profiles
 
 A profile is a convention layered on top of this generic container. It defines:
 
@@ -394,7 +517,7 @@ The GIS profile is specified in [`../../examples/gis-demo/gis-profile.md`](../..
 profiles (ML inference, reporting, scientific datasets, agent tools) register
 their own namespaces without touching this document.
 
-## 10. Opening & incremental verification
+## 11. Opening & incremental verification
 
 A host opens an artifact **lazily** over its backing store (local file, HTTP
 Range endpoint, object storage). Opening reads and verifies only:
@@ -420,6 +543,13 @@ The security invariant is unchanged versus whole-file verification: tampering
 is detected before the affected bytes are used, and undetected tampering is
 impossible — only *detection latency* moves from open time to first read.
 
+For a **sealed** artifact the boot area additionally reads the keybox and the
+encrypted private manifest (small), components are decrypted at open (their
+imports are needed for admission), and each fetched payload chunk is
+hash-checked against the private manifest's ciphertext-chunk list and then
+AEAD-decrypted before any plaintext reaches the guest. Fetch-mode choice
+(whole-file vs. range) and access-pattern leakage are covered in §8.1.
+
 Note on scale: the manifest carries the chunk hashes, so its size grows with
 payload size (32 bytes per 1 MiB chunk). This keeps even large artifacts'
 boot areas small (≈32 KB per GiB of payload); profiles shipping enormous
@@ -434,10 +564,14 @@ whole-file download should ship **multiple smaller artifacts** (e.g. one for
 text, one per media bundle) rather than one giant file — composition over
 size, and no format change required.
 
-## 11. Versioning & stability
+## 12. Versioning & stability
 
 - `format_version` (header + manifest) is the container contract. v1 readers
   reject a higher major version at the header, before any further parsing.
+- Readers reject unknown header flag bits, unknown directory tags, and unknown
+  manifest fields (fail-closed). Consequently any new flag, tag, or manifest
+  field — e.g. a future AEAD revision — is a *major* change: it ships with a
+  `format_version` bump, never silently ignored by an old reader.
 - While the format is at draft stage (`0.1.x`), byte layout may change between
   releases with a `format_version` bump; no compatibility guarantee is made.
 - Starting with the first stable tag (`1.0`): readers accept all artifacts of

@@ -15,10 +15,15 @@ pub fn run(
     args: &[String],
     component: Option<&str>,
     raw: bool,
+    content_key: Option<[u8; 32]>,
 ) -> Result<()> {
     // Lazy open: only the boot area and component bytes are read up front;
     // payload chunks are fetched and Merkle-verified on demand.
-    let artifact = Arc::new(Artifact::open_source(Arc::new(FileSource::open(file)?))?);
+    let source = Arc::new(FileSource::open(file)?);
+    let artifact = Arc::new(match &content_key {
+        Some(key) => Artifact::open_source_with_key(source, key)?,
+        None => Artifact::open_source(source)?,
+    });
 
     let comp_name = component
         .map(str::to_string)

@@ -3,12 +3,20 @@
 // Opens a .caf artifact LAZILY: only the boot area (header, manifest,
 // interface, section directory), the component bytes, and the signature are
 // read up front; payload bytes are fetched per 1 MiB chunk and Merkle-verified
-// before any byte reaches the component. Three loading modes:
+// before any byte reaches the component. Loading modes (openCaf's `fetchMode`
+// option, default "auto"):
 //
 //   1. URL on a Range-capable server + JSPI support: true on-demand reads
 //      (HTTP Range per chunk) — a 500 GB artifact opens after a few KB.
-//   2. URL without Range/JSPI: one whole-file GET, then in-memory lazy verify.
+//   2. URL without Range/JSPI (or fetchMode: "whole"): one whole-file GET,
+//      then in-memory lazy verify.
 //   3. ArrayBuffer / Uint8Array / Blob (file picker, drag-and-drop): in-memory.
+//
+// Sealed artifacts (FLAG_ENCRYPTED, spec §8) open with the 32-byte content key
+// (`openCaf(input, { contentKey })`): the whole artifact is fetched once
+// (no lazy range reads — decryption is async), the private manifest,
+// components, and payload blob are AES-256-GCM decrypted at open, and reads
+// are served from the verified plaintext.
 //
 // Security: every byte handed to the component is hash-verified before use;
 // component imports are enumerated and checked against the manifest's declared
@@ -19,11 +27,17 @@
 const MAGIC = [0x43, 0x41, 0x46, 0x00]; // "CAF\0"
 const HEADER_SIZE = 92;
 const CHUNK_SIZE = 1024 * 1024;
+const AEAD_TAG_LEN = 16;
 const TAG_COMPONENT = 0;
 const TAG_PAYLOAD = 1;
 const TAG_MANIFEST = 2;
 const TAG_SIGNATURE = 3;
+const TAG_KEYBOX = 4;
+const TAG_PRIVATE = 5;
+const KNOWN_TAGS = new Set([TAG_COMPONENT, TAG_PAYLOAD, TAG_MANIFEST, TAG_SIGNATURE, TAG_KEYBOX, TAG_PRIVATE]);
 const FLAG_SIGNED = 0x0001;
+const FLAG_ENCRYPTED = 0x0002;
+const KNOWN_FLAGS = FLAG_SIGNED | FLAG_ENCRYPTED;
 
 const utf8 = new TextDecoder();
 const utf8enc = new TextEncoder();
@@ -255,9 +269,11 @@ function readHeader(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const headerSize = leU16(dv, 8);
   if (headerSize !== HEADER_SIZE) throw new Error(`unsupported header size ${headerSize}`);
+  const flags = leU16(dv, 10);
+  if (flags & ~KNOWN_FLAGS) throw new Error(`unknown header flags 0x${flags.toString(16)}`);
   return {
     formatVersion: leU32(dv, 4),
-    flags: leU16(dv, 10),
+    flags,
     manifestOffset: leU64(dv, 12),
     manifestLen: leU64(dv, 20),
     interfaceOffset: leU64(dv, 28),
@@ -274,8 +290,10 @@ function decodeDirectory(bytes) {
   const entries = [];
   let pos = 4;
   for (let i = 0; i < count; i++) {
+    const tag = bytes[pos];
+    if (!KNOWN_TAGS.has(tag)) throw new Error(`unknown directory entry tag ${tag}`);
     entries.push({
-      tag: bytes[pos],
+      tag,
       offset: leU64(dv, pos + 1),
       length: leU64(dv, pos + 9),
       hash: toHex(bytes.slice(pos + 17, pos + 49)),
@@ -332,6 +350,35 @@ function computeRootHash(manifestHashHex, interfaceHashHex, wasmHashesHex, paylo
 }
 
 // ---------------------------------------------------------------------------
+// Sealed artifacts (FLAG_ENCRYPTED): AES-256-GCM sections under a content key
+// (spec §8). The JS host requires the *content key* directly (keybox unwrap is
+// a tool-side concern: `caf-tool verify --recipient-key` resolves it) and
+// decrypts everything at open — the whole-file fetch mode.
+// ---------------------------------------------------------------------------
+
+// KDF(label, ikm) = SHA-256("CAF-KDF-1" ‖ 0x00 ‖ label ‖ 0x00 ‖ ikm), matching
+// caf-core::crypto. Sound here because every IKM is a uniform 32-byte value.
+function cafKdf(label, ikm) {
+  return sha256Sync(concatBytes([utf8enc.encode("CAF-KDF-1"), new Uint8Array([0]), utf8enc.encode(label), new Uint8Array([0]), ikm]));
+}
+
+function sectionKey(contentKey, label) {
+  return cafKdf("section", concatBytes([contentKey, utf8enc.encode(label)]));
+}
+
+function chunkNonce(index) {
+  const nonce = new Uint8Array(12);
+  new DataView(nonce.buffer).setBigUint64(4, BigInt(index), false);
+  return nonce;
+}
+
+async function openChunk(sectionKeyBytes, index, ciphertext) {
+  const key = await crypto.subtle.importKey("raw", sectionKeyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: chunkNonce(index) }, key, ciphertext);
+  return new Uint8Array(plain);
+}
+
+// ---------------------------------------------------------------------------
 // Artifact
 // ---------------------------------------------------------------------------
 
@@ -339,15 +386,28 @@ export class Artifact {
   #source;
   #files = new Map(); // path -> { offset, length, node }
   #verifiedChunks = new Set(); // absolute chunk start offsets already verified
+  #sealed = null; // { blob, starts: Map<path, start> } — decrypted at open
 
-  constructor(source, header, manifest, directory, components, signature) {
+  constructor(source, header, manifest, directory, components, signature, sealed = null) {
     this.#source = source;
     this.header = header;
     this.manifest = manifest;
     this.directory = directory;
     this.components = components; // [{ ref, bytes, entry }]
     this.signature = signature; // { fingerprint, valid } | null
+    this.#sealed = sealed;
     const fileList = collectFiles(manifest.payloads[0].root, "", []);
+    if (sealed) {
+      // Sealed artifact: files map into the decrypted in-memory blob; every
+      // ciphertext chunk was hash-verified and AEAD-opened at open time.
+      let at = 0;
+      for (const f of fileList) {
+        sealed.starts.set(f.path, at);
+        this.#files.set(f.path, { offset: at, length: f.node.length, node: f.node });
+        at += f.node.length;
+      }
+      return;
+    }
     const payloadEntries = directory.filter((e) => e.tag === TAG_PAYLOAD);
     if (payloadEntries.length !== fileList.length) {
       throw new Error("payload directory/file count mismatch");
@@ -377,6 +437,10 @@ export class Artifact {
     if (!meta) throw new Error(`payload '${path}' not found`);
     if (pos + len > meta.length) throw new Error("payload range out of bounds");
     if (len === 0) return new Uint8Array(0);
+    if (this.#sealed) {
+      const start = this.#sealed.starts.get(path);
+      return this.#sealed.blob.slice(start + pos, start + pos + len);
+    }
     const node = meta.node;
     if ((node.chunks || []).length <= 1) {
       const data = await this.#fetchVerified(meta.offset, meta.length, node.hash);
@@ -402,6 +466,10 @@ export class Artifact {
     if (!meta) throw new Error(`payload '${path}' not found`);
     if (pos + len > meta.length) throw new Error("payload range out of bounds");
     if (len === 0) return new Uint8Array(0);
+    if (this.#sealed) {
+      const start = this.#sealed.starts.get(path);
+      return this.#sealed.blob.slice(start + pos, start + pos + len);
+    }
     const node = meta.node;
     if ((node.chunks || []).length <= 1) {
       const data = this.#fetchVerifiedSync(meta.offset, meta.length, node.hash);
@@ -686,11 +754,11 @@ class ComponentHandle {
 // openCaf — the entry point
 // ---------------------------------------------------------------------------
 
-export async function openCaf(input) {
+export async function openCaf(input, { fetchMode = "auto", contentKey = null } = {}) {
   // 1. Acquire a backing source.
   let source;
   if (typeof input === "string") {
-    source = await openUrl(input);
+    source = await openUrl(input, fetchMode);
   } else {
     source = await BufferSource.from(input);
   }
@@ -706,6 +774,11 @@ export async function openCaf(input) {
   if (!manifestEntry) throw new Error("directory has no manifest entry");
   const manifestHash = sha256Hex(manifestBytes);
   if (manifestHash !== manifestEntry.hash) throw new Error("manifest hash mismatch");
+
+  // Sealed artifact: decrypt with the content key (whole-file mode, §8.1).
+  if (header.flags & FLAG_ENCRYPTED) {
+    return openSealed(source, header, directory, manifestBytes, manifestHash, contentKey);
+  }
 
   const manifest = decodeCBOR(manifestBytes, 0).value;
   if (header.formatVersion !== manifest.format_version) throw new Error("format version mismatch");
@@ -753,21 +826,135 @@ export async function openCaf(input) {
   const rootHash = computeRootHash(manifestHash, interfaceHash, wasmHashes, payloadRoot.hash);
   if (rootHash !== header.rootHash) throw new Error("root hash mismatch");
 
-  // 5. Signature (best-effort: needs WebCrypto Ed25519).
-  let signature = null;
-  if (header.flags & FLAG_SIGNED) {
-    const sigEntry = directory.find((e) => e.tag === TAG_SIGNATURE);
-    if (!sigEntry) throw new Error("signed artifact has no signature directory entry");
-    const sigBytes = await source.readAt(sigEntry.offset, sigEntry.length);
-    if (sigBytes.length !== 96) throw new Error("signature section has unexpected length");
-    const pubkey = sigBytes.slice(0, 32);
-    const sig = sigBytes.slice(32, 96);
-    signature = { fingerprint: sha256Hex(pubkey), valid: await tryVerifyEd25519(pubkey, sig, manifestBytes) };
-    if (signature.valid === false) throw new Error("invalid signature");
-  }
+  // 5. Signature over the root hash (best-effort: needs WebCrypto Ed25519).
+  const signature = await readSignature(source, header, directory, rootHash);
 
   const artifact = new Artifact(source, header, manifest, directory, components, signature);
   return artifact;
+}
+
+// The ed25519 signature covers the 32-byte header root hash — the identity of
+// the stored bytes (ciphertext for sealed artifacts: Encrypt-then-Sign).
+async function readSignature(source, header, directory, rootHash) {
+  if (!(header.flags & FLAG_SIGNED)) return null;
+  const sigEntry = directory.find((e) => e.tag === TAG_SIGNATURE);
+  if (!sigEntry) throw new Error("signed artifact has no signature directory entry");
+  const sigBytes = await source.readAt(sigEntry.offset, sigEntry.length);
+  if (sigBytes.length !== 96) throw new Error("signature section has unexpected length");
+  const pubkey = sigBytes.slice(0, 32);
+  const sig = sigBytes.slice(32, 96);
+  const signature = { fingerprint: sha256Hex(pubkey), valid: await tryVerifyEd25519(pubkey, sig, hexToBytes(rootHash)) };
+  if (signature.valid === false) throw new Error("invalid signature");
+  return signature;
+}
+
+// Open a sealed artifact: verify the ciphertext hash chain, decrypt the
+// private manifest, components, and payload blob, and synthesize the
+// plaintext manifest view. Requires the whole artifact in memory (the
+// whole-file fetch mode — sealed artifacts never use lazy range reads here).
+async function openSealed(source, header, directory, envelopeBytes, envelopeHash, contentKeyOpt) {
+  if (!contentKeyOpt) {
+    throw new Error("artifact is sealed (FLAG_ENCRYPTED); pass { contentKey } (32-byte hex or bytes)");
+  }
+  const contentKey = typeof contentKeyOpt === "string" ? hexToBytes(contentKeyOpt) : contentKeyOpt;
+  if (contentKey.length !== 32) throw new Error("content key must be 32 bytes");
+  if (source instanceof RangeSource) {
+    // Decryption is async; lazy range reads are not supported for sealed
+    // artifacts — download once, then everything is local (§8.1).
+    const resp = await fetch(source.url);
+    if (!resp.ok) throw new Error(`fetch failed: HTTP ${resp.status}`);
+    source = new BufferSource(new Uint8Array(await resp.arrayBuffer()));
+  }
+
+  const envelope = decodeCBOR(envelopeBytes, 0).value;
+  if (header.formatVersion !== envelope.format_version) throw new Error("format version mismatch");
+  if (envelope.encryption?.aead !== "aes-256-gcm" || envelope.encryption?.wrap !== "p256-ecdh-sha256") {
+    throw new Error("unsupported encryption parameters");
+  }
+
+  const interfaceBytes = await source.readAt(header.interfaceOffset, header.interfaceLen);
+  const interfaceHash = sha256Hex(interfaceBytes);
+  if (interfaceHash !== envelope.interface.hash) throw new Error("interface hash mismatch");
+
+  // Private manifest.
+  const privateEntry = directory.find((e) => e.tag === TAG_PRIVATE);
+  if (!privateEntry) throw new Error("sealed artifact has no private manifest entry");
+  const privateCt = await source.readAt(privateEntry.offset, privateEntry.length);
+  if (sha256Hex(privateCt) !== envelope.private.hash) throw new Error("private manifest hash mismatch");
+  const privatePlain = await openChunk(sectionKey(contentKey, "private"), 0, privateCt);
+  const priv = decodeCBOR(privatePlain, 0).value;
+  if (!priv.payloads || priv.payloads.length !== 1) throw new Error("expected exactly one payload tree");
+  const payloadRef = priv.payloads[0];
+  verifyTree(payloadRef.root);
+  for (const comp of priv.components || []) {
+    for (const scope of comp.access || []) {
+      const node = findNode(payloadRef.root, scope.path);
+      if (!node) throw new Error(`access scope '${scope.path}' not found`);
+      if (node.hash !== scope.hash) throw new Error(`access scope '${scope.path}' hash mismatch`);
+    }
+  }
+
+  // Components: ciphertext hash check, decrypt, plaintext hash check.
+  const componentEntries = directory.filter((e) => e.tag === TAG_COMPONENT);
+  if (componentEntries.length !== (envelope.components || []).length) throw new Error("component count mismatch");
+  const components = [];
+  const wasmHashes = [];
+  for (let i = 0; i < envelope.components.length; i++) {
+    const section = envelope.components[i];
+    const entry = componentEntries[i];
+    const ct = await source.readAt(entry.offset, entry.length);
+    const h = sha256Hex(ct);
+    if (h !== section.hash || h !== entry.hash) throw new Error(`sealed component ${i} hash mismatch`);
+    const plain = await openChunk(sectionKey(contentKey, `component/${i}`), 0, ct);
+    const ref = priv.components[i];
+    if (sha256Hex(plain) !== ref.hash) throw new Error(`component '${ref.name}' plaintext hash mismatch`);
+    wasmHashes.push(h);
+    components.push({ ref: { ...ref, length: plain.length }, bytes: plain, entry });
+  }
+
+  // Payload blob: verify the ciphertext hash, then decrypt per chunk.
+  const blobEntries = directory.filter((e) => e.tag === TAG_PAYLOAD);
+  if (blobEntries.length !== 1) throw new Error("sealed artifact must carry exactly one payload blob");
+  const blobEntry = blobEntries[0];
+  const blob = await source.readAt(blobEntry.offset, blobEntry.length);
+  const blobHash = sha256Hex(blob);
+  if (blobHash !== envelope.payload.hash || blobHash !== blobEntry.hash) throw new Error("payload blob hash mismatch");
+  const paddedLength = Number(envelope.payload.padded_length);
+  const chunkCount = Math.ceil(paddedLength / CHUNK_SIZE);
+  if (chunkCount !== envelope.payload.chunks) throw new Error("payload chunk count mismatch");
+  const payloadKey = sectionKey(contentKey, "payload");
+  const plainParts = [];
+  for (let i = 0; i < chunkCount; i++) {
+    const cs = i * CHUNK_SIZE;
+    const ce = Math.min(cs + CHUNK_SIZE, paddedLength);
+    const ctOff = i * (CHUNK_SIZE + AEAD_TAG_LEN);
+    const ct = blob.slice(ctOff, ctOff + (ce - cs) + AEAD_TAG_LEN);
+    if (sha256Hex(ct) !== payloadRef.chunks[i]) throw new Error(`payload chunk ${i} ciphertext hash mismatch`);
+    plainParts.push(await openChunk(payloadKey, i, ct));
+  }
+
+  // Root identity over the stored (ciphertext) sections, then the signature.
+  const rootHash = computeRootHash(envelopeHash, interfaceHash, wasmHashes, blobHash);
+  if (rootHash !== header.rootHash) throw new Error("root hash mismatch");
+  const signature = await readSignature(source, header, directory, rootHash);
+
+  // Synthesize the plaintext manifest view.
+  const manifest = {
+    name: priv.name,
+    version: priv.version,
+    format_version: envelope.format_version,
+    interface: envelope.interface,
+    components: priv.components,
+    capabilities: envelope.capabilities,
+    execution: envelope.execution,
+    resources: envelope.resources,
+    policy: envelope.policy,
+    provenance: priv.provenance,
+    payloads: priv.payloads,
+    hashes: { interface: interfaceHash, wasm: wasmHashes, payload: [blobHash] },
+  };
+  const sealed = { blob: concatBytes(plainParts), starts: new Map() };
+  return new Artifact(source, header, manifest, directory, components, signature, sealed);
 }
 
 async function tryVerifyEd25519(pubkey, sig, msg) {
@@ -780,10 +967,16 @@ async function tryVerifyEd25519(pubkey, sig, msg) {
   }
 }
 
-// URL loading: probe with a Range request. 206 + JSPI → true range mode
-// (on-demand chunk fetches); otherwise the probe's body (a non-Range server
-// answers 200 with the whole file) or a plain GET becomes the in-memory source.
-async function openUrl(url) {
+// URL loading. fetchMode: "auto" probes with a Range request (206 + JSPI →
+// true range mode; otherwise whole-file fallback); "whole" forces one GET (no
+// access-pattern leakage, the mode sealed artifacts use); "range" requires
+// Range+JSPI and fails otherwise.
+async function openUrl(url, fetchMode = "auto") {
+  if (fetchMode === "whole") {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`fetch failed: HTTP ${resp.status}`);
+    return new BufferSource(new Uint8Array(await resp.arrayBuffer()));
+  }
   const probe = await fetch(url, { headers: { Range: `bytes=0-${HEADER_SIZE - 1}` } });
   if (probe.status === 206) {
     const total = respContentRangeTotal(probe);
@@ -793,11 +986,13 @@ async function openUrl(url) {
       src.bytesFetched += head.length;
       return src;
     }
+    if (fetchMode === "range") throw new Error("fetchMode 'range' requires JSPI (WebAssembly.Suspending)");
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`fetch failed: HTTP ${resp.status}`);
     return new BufferSource(new Uint8Array(await resp.arrayBuffer()));
   }
   if (!probe.ok) throw new Error(`fetch failed: HTTP ${probe.status}`);
+  if (fetchMode === "range") throw new Error("fetchMode 'range' but the server does not support Range");
   return new BufferSource(new Uint8Array(await probe.arrayBuffer()));
 }
 
@@ -809,8 +1004,8 @@ function respContentRangeTotal(resp) {
 }
 
 // Convenience: open the first component directly.
-export async function openComponent(input, component) {
-  const artifact = await openCaf(input);
+export async function openComponent(input, component, options = {}) {
+  const artifact = await openCaf(input, options);
   const comp = await artifact.instantiate(component ?? 0);
   return { artifact, comp };
 }
@@ -825,7 +1020,7 @@ export async function openComponent(input, component) {
 // rendering) belong on the main thread with trusted artifacts.
 // ---------------------------------------------------------------------------
 
-export function openCafWorker(input, { component, timeout = 30000 } = {}) {
+export function openCafWorker(input, { component, timeout = 30000, options = {} } = {}) {
   const worker = new Worker(new URL("./caf.worker.js", import.meta.url), { type: "module" });
   let nextId = 1;
   let dead = false;
@@ -857,9 +1052,9 @@ export function openCafWorker(input, { component, timeout = 30000 } = {}) {
   }
 
   // File/Blob and ArrayBuffer are structured-cloneable into the worker;
-  // strings (URLs) too.
+  // strings (URLs) too. `options` (contentKey for sealed artifacts) rides along.
   return (async () => {
-    const meta = await send("open", { source: input, component });
+    const meta = await send("open", { source: input, component, options });
     return {
       mode: "worker",
       artifact: meta,

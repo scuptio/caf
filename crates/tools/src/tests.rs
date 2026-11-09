@@ -190,6 +190,212 @@ fn signed_roundtrip_verifies() -> Result<()> {
 }
 
 #[test]
+fn unknown_header_flags_are_rejected() -> Result<()> {
+    let dir = temp_root("unknown-flags")?;
+    write_config(&dir, &["/data"])?;
+    let mut bytes = build_bytes(&dir)?;
+
+    // Set an undefined flag bit (header flags are the u16 at offset 10).
+    bytes[10] |= 0x04;
+
+    assert!(layout::read_header(&bytes).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn manifest_with_unknown_field_is_rejected() -> Result<()> {
+    let dir = temp_root("unknown-field")?;
+    write_config(&dir, &["/data"])?;
+    let bytes = build_bytes(&dir)?;
+
+    // Add an `encrypted` key to the manifest map: a future reader's extension
+    // must be a hard error for this reader, never silently ignored.
+    let header = layout::read_header(&bytes)?;
+    let manifest_bytes = layout::slice(&bytes, header.manifest_offset, header.manifest_len)?;
+    let mut value: ciborium::value::Value = ciborium::de::from_reader(manifest_bytes)?;
+    let ciborium::value::Value::Map(ref mut map) = value else {
+        anyhow::bail!("manifest is not a CBOR map");
+    };
+    map.push((
+        ciborium::value::Value::Text("encrypted".to_string()),
+        ciborium::value::Value::Bool(true),
+    ));
+    let mut tampered = Vec::new();
+    ciborium::ser::into_writer(&value, &mut tampered)?;
+
+    let decoded: Result<manifest::Manifest, _> = ciborium::de::from_reader(tampered.as_slice());
+    assert!(decoded.is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sealed artifacts ([encrypt]): keybox, envelope/private manifest, AEAD chunks.
+// ---------------------------------------------------------------------------
+
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+/// A fresh P-256 recipient keypair `(secret, public)` for sealed-build tests.
+fn recipient_keypair() -> (p256::SecretKey, String) {
+    let secret = p256::SecretKey::random(&mut rand_core::OsRng);
+    let public = hex::encode(secret.public_key().to_encoded_point(false).as_bytes());
+    (secret, public)
+}
+
+fn write_sealed_config(
+    dir: &Path,
+    access: &[&str],
+    recipient_pub: &str,
+    key_seed: Option<&str>,
+    sign_seed: Option<&str>,
+) -> Result<()> {
+    let seed_line = key_seed
+        .map(|s| format!("key_seed = \"{s}\"\n"))
+        .unwrap_or_default();
+    let sign_section = match sign_seed {
+        Some(s) => format!("\n[sign]\nseed = \"{s}\"\n"),
+        None => String::new(),
+    };
+    let extra =
+        format!("\n[encrypt]\nrecipients = [\"{recipient_pub}\"]\n{seed_line}{sign_section}");
+    write_config_full(dir, access, b"\0asm\x01\0\0\0", &extra)
+}
+
+#[test]
+fn sealed_roundtrip_reads_payload() -> Result<()> {
+    let (secret, public) = recipient_keypair();
+    let dir = temp_root("sealed")?;
+    let seed = "22".repeat(32);
+    write_sealed_config(&dir, &["/data"], &public, Some(&seed), None)?;
+    let bytes = build_bytes(&dir)?;
+
+    let header = layout::read_header(&bytes)?;
+    assert_ne!(header.flags & layout::FLAG_ENCRYPTED, 0);
+
+    // Public tier: verifies without a key, redacts everything sensitive.
+    let report = verify::verify_bytes(&bytes)?;
+    assert!(report.encrypted);
+    assert_eq!(report.name, "<sealed>");
+    assert_eq!(report.payload_files, 0);
+    assert_eq!(report.components, 1);
+
+    // The recipient unwraps the keybox; a stranger does not.
+    let content_key = caf_core::crypto::unwrap_artifact(&bytes, &secret)?.expect("stanza matches");
+    let (stranger, _) = recipient_keypair();
+    assert!(caf_core::crypto::unwrap_artifact(&bytes, &stranger)?.is_none());
+
+    // Full tier with the content key.
+    let report = verify::verify_bytes_keyed(&bytes, Some(&content_key))?;
+    assert_eq!(report.name, "city");
+    assert_eq!(report.payload_files, 2);
+
+    // The runtime reads payload bytes through decryption; opening without the
+    // key must fail.
+    assert!(caf_runtime::Artifact::open(bytes.clone()).is_err());
+    let artifact = caf_runtime::Artifact::open_with_key(bytes, &content_key)?;
+    assert_eq!(
+        artifact.read_payload("/data/city.parquet")?,
+        b"parquet-bytes"
+    );
+    assert_eq!(artifact.read_payload("/index/rtree.bin")?, b"index-bytes");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn sealed_convergent_builds_are_deterministic() -> Result<()> {
+    let (_secret, public) = recipient_keypair();
+    let dir = temp_root("sealed-convergent")?;
+    let seed = "33".repeat(32);
+    write_sealed_config(&dir, &["/data"], &public, Some(&seed), None)?;
+
+    let a = build_bytes(&dir)?;
+    let b = build_bytes(&dir)?;
+    assert_eq!(a, b, "same key_seed must reproduce identical ciphertext");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn sealed_random_builds_differ() -> Result<()> {
+    let (_secret, public) = recipient_keypair();
+    let dir = temp_root("sealed-random")?;
+    write_sealed_config(&dir, &["/data"], &public, None, None)?;
+
+    let a = build_bytes(&dir)?;
+    let b = build_bytes(&dir)?;
+    assert_ne!(a, b, "random content keys must randomize the ciphertext");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn sealed_signed_roundtrip_verifies() -> Result<()> {
+    let (secret, public) = recipient_keypair();
+    let dir = temp_root("sealed-signed")?;
+    let seed = "44".repeat(32);
+    let sign_seed = "55".repeat(32);
+    write_sealed_config(&dir, &["/data"], &public, Some(&seed), Some(&sign_seed))?;
+    let bytes = build_bytes(&dir)?;
+
+    let header = layout::read_header(&bytes)?;
+    assert_ne!(header.flags & layout::FLAG_ENCRYPTED, 0);
+    assert_ne!(header.flags & layout::FLAG_SIGNED, 0);
+
+    // Encrypt-then-Sign: the signature covers the ciphertext root hash and
+    // verifies on the public tier.
+    let report = verify::verify_bytes(&bytes)?;
+    assert_eq!(report.signature_valid, Some(true));
+    let content_key = caf_core::crypto::unwrap_artifact(&bytes, &secret)?.expect("stanza matches");
+    let report = verify::verify_bytes_keyed(&bytes, Some(&content_key))?;
+    assert_eq!(report.signature_valid, Some(true));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn sealed_tampered_ciphertext_is_detected() -> Result<()> {
+    let (secret, public) = recipient_keypair();
+    let dir = temp_root("sealed-tamper")?;
+    let seed = "66".repeat(32);
+    write_sealed_config(&dir, &["/data"], &public, Some(&seed), None)?;
+    let mut bytes = build_bytes(&dir)?;
+
+    // Flip a byte inside the payload blob's first chunk.
+    let header = layout::read_header(&bytes)?;
+    let directory = layout::decode_directory(layout::slice(
+        &bytes,
+        header.directory_offset,
+        header.directory_len,
+    )?)?;
+    let blob = directory
+        .iter()
+        .find(|e| e.tag == layout::TAG_PAYLOAD)
+        .ok_or_else(|| anyhow::anyhow!("missing payload blob entry"))?;
+    bytes[blob.offset as usize] ^= 0xff;
+
+    assert!(verify::verify_bytes(&bytes).is_err());
+    let content_key = caf_core::crypto::unwrap_artifact(&bytes, &secret)?.expect("stanza matches");
+    // Lazy open succeeds (payload bytes are verified on first read)...
+    let artifact = caf_runtime::Artifact::open_source_with_key(
+        std::sync::Arc::new(caf_runtime::SliceSource::new(bytes)),
+        &content_key,
+    )?;
+    // ...and the tampered chunk is caught on read.
+    assert!(artifact.read_payload("/data/city.parquet").is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
 fn tampered_payload_is_detected() -> Result<()> {
     let dir = temp_root("tamper")?;
     write_config(&dir, &["/data"])?;

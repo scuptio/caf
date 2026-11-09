@@ -19,6 +19,8 @@ ciborium = "0.2"
 # Hashing / crypto.
 sha2 = "0.11"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+aes-gcm = "0.10"
+p256 = { version = "0.13", features = ["ecdh"] }
 
 # WASM parsing (component export inspection; lightweight, no codegen).
 wasmparser = "0.262"

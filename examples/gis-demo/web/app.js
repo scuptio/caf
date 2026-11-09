@@ -32,9 +32,9 @@ const ctx = canvas.getContext("2d");
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
-async function loadSource(source) {
+async function loadSource(source, options = {}) {
   try {
-    const artifact = await CAF.openCaf(source);
+    const artifact = await CAF.openCaf(source, options);
     const comp = await artifact.instantiate("projection");
 
     const result = await comp.callPacked("features_from_file", state.format);
@@ -391,9 +391,18 @@ wrap.addEventListener("drop", (e) => {
 // Range-capable server + JSPI the artifact opens lazily and payload chunks are
 // fetched on demand; otherwise the whole file downloads once). Over file://
 // fetch fails — the user opens the file via the picker / drag-and-drop.
+//
+// With `?sealed` in the URL the encrypted variant demo-sealed.caf is loaded
+// instead (whole-file fetch + decrypt at open; the demo content key lives in
+// sealed-key.js — public on purpose, see build-sealed.toml).
 // ---------------------------------------------------------------------------
 (async () => {
   try {
+    if (new URLSearchParams(location.search).has("sealed")) {
+      const { DEMO_CONTENT_KEY } = await import("./sealed-key.js");
+      await loadSource("demo-sealed.caf", { contentKey: DEMO_CONTENT_KEY });
+      return;
+    }
     await loadSource("demo.caf");
   } catch (_) {
     /* static file:// — wait for user to open the file */

@@ -11,4 +11,6 @@ serde = { workspace = true }
 ciborium = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
+aes-gcm = { workspace = true }
+p256 = { workspace = true }
 anyhow = { workspace = true }

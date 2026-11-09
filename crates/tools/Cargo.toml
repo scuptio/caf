@@ -19,6 +19,7 @@ toml = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 wasmparser = { workspace = true }
 caf-core = { workspace = true }

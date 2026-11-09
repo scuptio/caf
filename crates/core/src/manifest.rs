@@ -138,7 +138,13 @@ impl<'de> Deserialize<'de> for CapabilityId {
 /// The artifact's self-description: identity, interface, components,
 /// capabilities, execution profile, resource limits, policy, provenance,
 /// payload trees, and the hashes of the other sections.
-#[derive(Serialize, Deserialize, Debug)]
+///
+/// All manifest structs deny unknown fields: a reader rejects a manifest
+/// carrying fields it does not know (fail-closed), so any new field — e.g. an
+/// `encrypted` marker — requires a `format_version` major bump rather than
+/// being silently ignored.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Artifact name.
     pub name: String,
@@ -167,7 +173,8 @@ pub struct Manifest {
 }
 
 /// Reference to the artifact's interface (WIT text) section.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct InterfaceRef {
     /// Whether the WIT text is inlined in the manifest (unused in format v1).
     pub inline: bool,
@@ -178,7 +185,8 @@ pub struct InterfaceRef {
 }
 
 /// Manifest binding for one embedded WASM component.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentRef {
     /// Component name (unique within the artifact).
     pub name: String,
@@ -195,7 +203,8 @@ pub struct ComponentRef {
 }
 
 /// One exported function, bound to the capability that names it.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ExportEntry {
     /// Capability id (`namespace:name@version`) this export belongs to.
     pub capability: String,
@@ -207,7 +216,8 @@ pub struct ExportEntry {
 }
 
 /// A payload path a component may read, pinned to the node's hash.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct AccessScope {
     /// `/`-prefixed payload path.
     pub path: String,
@@ -218,7 +228,8 @@ pub struct AccessScope {
 }
 
 /// A named, machine-checkable engine configuration the components run under.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionProfile {
     /// Profile name (this runtime knows `caf-d1`).
     pub profile: String,
@@ -227,7 +238,8 @@ pub struct ExecutionProfile {
 }
 
 /// Declared resource budgets, enforced at instantiation and run time.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     /// Maximum guest linear memory, in bytes (engine store limiter).
     pub memory_max: u64,
@@ -241,7 +253,8 @@ pub struct ResourceLimits {
 
 /// Ambient authority the artifact requests. A capability declared but
 /// unsupported by the runtime is a hard admission error (fail-closed).
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityPolicy {
     /// May read the artifact's own payload (the scoped `payload-fs` host ABI).
     pub self_read: bool,
@@ -256,7 +269,8 @@ pub struct CapabilityPolicy {
 }
 
 /// Publisher provenance for the three roles that produced the artifact.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     /// Who published the input data.
     pub data: Publisher,
@@ -267,7 +281,8 @@ pub struct Provenance {
 }
 
 /// A named publisher, optionally carrying a signature reference.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Publisher {
     /// Publisher identity (free-form name).
     pub publisher: String,
@@ -286,23 +301,37 @@ impl Publisher {
 }
 
 /// Reference to one payload tree: a virtual filesystem of content-hashed files.
-#[derive(Serialize, Deserialize, Debug)]
+/// In a sealed artifact this lives in the *private* manifest and additionally
+/// describes the encrypted single-blob layout (`chunks` / `padded_length`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadRef {
-    /// Root node of the Merkle-hashed directory tree.
+    /// Root node of the Merkle-hashed directory tree. In a sealed artifact the
+    /// per-file hashes cover *plaintext* (identity after decryption).
     pub root: PayloadNode,
     /// Media type of the payload bytes.
     pub media_type: String,
-    /// Total byte length of the payload (unused in format v1).
+    /// Total real plaintext byte length of the payload (sealed artifacts;
+    /// unused otherwise).
     pub length: u64,
-    /// SHA-256 (hex) of the tree root — mirrors `root.hash` for direct lookup.
+    /// SHA-256 (hex) of the tree root (plaintext mode) or of the encrypted
+    /// payload blob's ciphertext (sealed mode) — mirrors the directory entry.
     pub hash: String,
     /// Compression, if any (reserved in format v1).
     pub compressed: Option<Compression>,
+    /// Padded plaintext length of the payload blob (sealed artifacts only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padded_length: Option<u64>,
+    /// Global ciphertext chunk hashes of the payload blob (sealed artifacts
+    /// only), covering chunks of `padded_length` bytes including AEAD tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<String>,
 }
 
 /// One node of the payload tree: a file (with chunk hashes) or a directory
 /// (whose hash covers its children).
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadNode {
     /// File or directory.
     pub kind: EntryKind,
@@ -324,7 +353,8 @@ pub struct PayloadNode {
 /// the manifest's own encoding. The manifest hash and root hash are *not* stored
 /// here — they are derived (root lives in the header; manifest hash lives in the
 /// directory), which keeps the manifest free of self-referential hashes.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct SectionHashes {
     /// SHA-256 (hex) of the interface section.
     pub interface: String,
@@ -332,4 +362,133 @@ pub struct SectionHashes {
     pub wasm: Vec<String>,
     /// SHA-256 (hex) of each payload tree root.
     pub payload: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Sealed artifacts (FLAG_ENCRYPTED): the manifest section holds the public
+// envelope; everything sensitive moves into the encrypted private manifest.
+// ---------------------------------------------------------------------------
+
+/// Reference to one ciphertext (or fixed-format plaintext) section: its byte
+/// length and SHA-256 (hex) over the *stored* bytes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct SectionRef {
+    /// Byte length of the section as stored.
+    pub length: u64,
+    /// SHA-256 (hex) of the stored bytes.
+    pub hash: String,
+}
+
+/// Reference to the single encrypted payload blob.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadBlobRef {
+    /// Byte length of the stored ciphertext (padded plaintext + per-chunk tags).
+    pub length: u64,
+    /// Padded plaintext length (power of two, >= 4096).
+    pub padded_length: u64,
+    /// Number of 1 MiB ciphertext chunks.
+    pub chunks: u64,
+    /// SHA-256 (hex) of the stored ciphertext blob.
+    pub hash: String,
+}
+
+/// AEAD algorithm for sealed sections.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AeadAlgorithm {
+    /// AES-256-GCM with per-section sub-keys and counter nonces.
+    #[serde(rename = "aes-256-gcm")]
+    Aes256Gcm,
+}
+
+/// Key-wrap algorithm for keybox stanzas.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyWrapAlgorithm {
+    /// P-256 ECDH + domain-separated SHA-256 KDF + AES-256-GCM wrap.
+    #[serde(rename = "p256-ecdh-sha256")]
+    P256EcdhSha256,
+}
+
+/// Payload length-hiding padding profile.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaddingProfile {
+    /// Padded to the next power of two, 4 KiB floor.
+    #[serde(rename = "pow2")]
+    Pow2,
+}
+
+/// Encryption parameters of a sealed artifact (public; algorithms only, no keys).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionInfo {
+    /// AEAD for sealed sections.
+    pub aead: AeadAlgorithm,
+    /// Keybox stanza wrap algorithm.
+    pub wrap: KeyWrapAlgorithm,
+    /// Payload padding profile.
+    pub padding: PaddingProfile,
+}
+
+/// The public **envelope manifest** of a sealed artifact: only what admission
+/// and discovery need before decryption — no names, no payload tree, no
+/// provenance. All hashes cover the *stored* (ciphertext) bytes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Envelope {
+    /// Container format version (must match the header's).
+    pub format_version: u32,
+    /// Reference to the interface (WIT text) section (plaintext).
+    pub interface: InterfaceRef,
+    /// Anonymous ciphertext refs of the WASM components, in manifest order.
+    pub components: Vec<SectionRef>,
+    /// Capabilities the artifact exposes (`namespace:name@version`).
+    pub capabilities: Vec<CapabilityId>,
+    /// Execution profile the components run under.
+    pub execution: ExecutionProfile,
+    /// Declared resource budgets.
+    pub resources: ResourceLimits,
+    /// Capability policy: the ambient authority the artifact requests.
+    pub policy: CapabilityPolicy,
+    /// Encryption parameters.
+    pub encryption: EncryptionInfo,
+    /// Encrypted private manifest section.
+    pub private: SectionRef,
+    /// Keybox section (plaintext recipient stanzas).
+    pub keybox: SectionRef,
+    /// Encrypted payload blob.
+    pub payload: PayloadBlobRef,
+}
+
+/// A component's private metadata: everything the envelope hides.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateComponent {
+    /// Component name (unique within the artifact).
+    pub name: String,
+    /// WIT world the component implements (empty without a declared interface).
+    pub world: String,
+    /// SHA-256 (hex) of the *plaintext* component bytes.
+    pub hash: String,
+    /// Capability-bound exports (see `doc/spec/caf-abi.md`).
+    pub exports: Vec<ExportEntry>,
+    /// Payload paths the component may read — a hard runtime invariant.
+    pub access: Vec<AccessScope>,
+}
+
+/// The encrypted **private manifest**: names, versions, provenance, component
+/// bindings, and the payload tree with real (plaintext) lengths and hashes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateManifest {
+    /// Artifact name.
+    pub name: String,
+    /// Artifact version (semver).
+    pub version: String,
+    /// Per-component private metadata, in envelope component order.
+    pub components: Vec<PrivateComponent>,
+    /// Publisher provenance for data, algorithm, and artifact.
+    pub provenance: Provenance,
+    /// Payload trees (exactly one in format v1).
+    pub payloads: Vec<PayloadRef>,
 }

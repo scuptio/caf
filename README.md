@@ -77,6 +77,12 @@ cargo run -p caf-tool -- build -c build.toml -o artifact.caf \
 # Verify a .caf artifact (hash chain, access scopes, signature)
 cargo run -p caf-tool -- verify artifact.caf
 
+# Seal an artifact (encrypted components + payload + private manifest);
+# see doc/spec/container-format.md §8
+cargo run -p caf-tool -- keygen --recipient   # P-256 recipient keypair
+#   → add [encrypt] recipients = ["<pub hex>"] to build.toml
+cargo run -p caf-tool -- verify artifact.caf --recipient-key <secret hex>
+
 # Inspect / list / diff
 cargo run -p caf-tool -- inspect artifact.caf        # human-readable summary
 cargo run -p caf-tool -- ls artifact.caf             # payload files + components

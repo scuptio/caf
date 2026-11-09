@@ -24,7 +24,7 @@ use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
 };
 
-use caf_core::{hex, identity, layout, manifest, payload};
+use caf_core::{crypto, hex, identity, layout, manifest, payload};
 use caf_security::{Import, Meter};
 
 pub use wasmtime::{Val, ValType};
@@ -113,11 +113,31 @@ pub struct Artifact {
     header: layout::Header,
     manifest: manifest::Manifest,
     directory: Vec<layout::DirectoryEntry>,
+    /// Sealed-artifact state (content key, blob geometry, chunk hashes).
+    sealed: Option<SealedState>,
     /// Bounded LRU cache of verified chunk bytes, keyed by the chunk's absolute
     /// start offset. Verified bytes are safe to reuse; the cache exists because
     /// guests read in small windows while verification needs whole chunks —
     /// without it, physical reads would amplify ~128×.
     chunk_cache: Mutex<ChunkCache>,
+}
+
+/// Decryption state of a sealed (`FLAG_ENCRYPTED`) artifact. The synthesized
+/// `manifest` holds the plaintext view (names, tree, access scopes); this
+/// state holds what the stored ciphertext needs.
+struct SealedState {
+    /// The unwrapped 32-byte content key.
+    content_key: [u8; 32],
+    /// Absolute offset of the payload ciphertext blob section.
+    blob_offset: u64,
+    /// Padded plaintext length (power of two).
+    padded_length: u64,
+    /// Global ciphertext chunk hashes of the payload blob.
+    ct_chunk_hashes: Vec<String>,
+    /// Path → (start offset within the plaintext blob, real length).
+    file_starts: HashMap<String, (u64, u64)>,
+    /// SHA-256 (hex) of each component's *plaintext* bytes.
+    component_plaintext_hashes: Vec<String>,
 }
 
 /// Verified-chunk LRU with a fixed capacity (64 × 1 MiB chunks max).
@@ -168,14 +188,39 @@ impl Artifact {
         Self::open_source(Arc::new(SliceSource::new(bytes)))
     }
 
+    /// [`Artifact::open`] for a sealed artifact, additionally decrypting with
+    /// the content key.
+    pub fn open_with_key(bytes: Vec<u8>, content_key: &[u8; 32]) -> Result<Self> {
+        caf_core::verify::verify_bytes_keyed(&bytes, Some(content_key))
+            .context("verify artifact")?;
+        Self::open_source_keyed(Arc::new(SliceSource::new(bytes)), Some(content_key))
+    }
+
     /// Open an artifact over a backing store, reading only the boot area
     /// (header, manifest, interface, directory), the component bytes (small;
     /// needed for admission), and the signature if present. Payload bytes are
     /// **not** read here: they are fetched and Merkle-verified per chunk on
     /// first use, so opening a large artifact costs a few KB of reads.
     pub fn open_source(source: Arc<dyn PayloadSource>) -> Result<Self> {
+        Self::open_source_keyed(source, None)
+    }
+
+    /// [`Artifact::open_source`] for a sealed artifact. Payload chunks are
+    /// still lazy: each fetched ciphertext chunk is hash-verified, decrypted,
+    /// and only then served.
+    pub fn open_source_with_key(
+        source: Arc<dyn PayloadSource>,
+        content_key: &[u8; 32],
+    ) -> Result<Self> {
+        Self::open_source_keyed(source, Some(content_key))
+    }
+
+    fn open_source_keyed(source: Arc<dyn PayloadSource>, key: Option<&[u8; 32]>) -> Result<Self> {
         let head = source.read_at(0, layout::HEADER_SIZE)?;
         let header = layout::read_header(&head)?;
+        if header.flags & layout::FLAG_ENCRYPTED != 0 {
+            return Self::open_sealed(source, header, key);
+        }
 
         let manifest_bytes = source.read_at(header.manifest_offset, header.manifest_len)?;
         let directory_bytes = source.read_at(header.directory_offset, header.directory_len)?;
@@ -276,7 +321,9 @@ impl Artifact {
             bail!("root hash mismatch");
         }
 
-        // The signature section is 96 bytes; verify it at open.
+        // The signature section is 96 bytes; verify it at open. The signature
+        // covers the header root hash (Encrypt-then-Sign for sealed artifacts;
+        // the same rule keeps plaintext artifacts uniform).
         if header.flags & layout::FLAG_SIGNED != 0 {
             let sig_entry = directory
                 .iter()
@@ -289,7 +336,7 @@ impl Artifact {
                     sig_bytes.len()
                 );
             }
-            if !payload::verify_signature(&sig_bytes[..32], &sig_bytes[32..], &manifest_bytes) {
+            if !payload::verify_signature(&sig_bytes[..32], &sig_bytes[32..], &root_hash) {
                 bail!("invalid signature");
             }
         }
@@ -314,6 +361,264 @@ impl Artifact {
             header,
             manifest,
             directory,
+            sealed: None,
+            chunk_cache: Mutex::new(ChunkCache::new()),
+        })
+    }
+
+    /// Open a sealed (`FLAG_ENCRYPTED`) artifact: verify every stored
+    /// (ciphertext) hash and the signature, unwrap the private manifest with
+    /// the content key, decrypt the components (small; admission needs their
+    /// imports), and synthesize the plaintext manifest view. Payload chunks
+    /// stay lazy.
+    fn open_sealed(
+        source: Arc<dyn PayloadSource>,
+        header: layout::Header,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Self> {
+        let content_key = *key.context(
+            "artifact is sealed (FLAG_ENCRYPTED); supply the content key via \
+             open_with_key / open_source_with_key",
+        )?;
+
+        let envelope_bytes = source.read_at(header.manifest_offset, header.manifest_len)?;
+        let directory_bytes = source.read_at(header.directory_offset, header.directory_len)?;
+        let directory = layout::decode_directory(&directory_bytes)?;
+
+        let envelope: manifest::Envelope =
+            ciborium::de::from_reader(envelope_bytes.as_slice()).context("decode envelope")?;
+        if header.format_version != envelope.format_version {
+            bail!(
+                "format version mismatch: header {}, envelope {}",
+                header.format_version,
+                envelope.format_version
+            );
+        }
+        if envelope.encryption.aead != manifest::AeadAlgorithm::Aes256Gcm
+            || envelope.encryption.wrap != manifest::KeyWrapAlgorithm::P256EcdhSha256
+            || envelope.encryption.padding != manifest::PaddingProfile::Pow2
+        {
+            bail!("unsupported encryption parameters");
+        }
+
+        let manifest_entry = directory
+            .iter()
+            .find(|e| e.tag == layout::TAG_MANIFEST)
+            .context("directory has no manifest entry")?;
+        let envelope_hash = payload::chunk_hash(&envelope_bytes);
+        if manifest_entry.hash != decode_hash(&envelope_hash)? {
+            bail!("envelope hash mismatch");
+        }
+
+        let interface_bytes = source.read_at(header.interface_offset, header.interface_len)?;
+        let interface_hash = payload::chunk_hash(&interface_bytes);
+        if interface_hash != envelope.interface.hash {
+            bail!("interface hash mismatch");
+        }
+
+        // Private manifest: decrypt and cross-check the section hash.
+        let private_entry = directory
+            .iter()
+            .find(|e| e.tag == layout::TAG_PRIVATE)
+            .context("sealed artifact has no private manifest entry")?;
+        let private_ct = source.read_at(private_entry.offset, private_entry.length)?;
+        if payload::chunk_hash(&private_ct) != envelope.private.hash {
+            bail!("private manifest hash mismatch");
+        }
+        let private_key = crypto::section_key(&content_key, "private");
+        let private_plain = crypto::open_chunk(&private_key, 0, &private_ct)?;
+        let private: manifest::PrivateManifest =
+            ciborium::de::from_reader(private_plain.as_slice())
+                .context("decode private manifest")?;
+        if private.payloads.len() != 1 {
+            bail!(
+                "expected exactly one payload tree, got {}",
+                private.payloads.len()
+            );
+        }
+        if private.components.len() != envelope.components.len() {
+            bail!("private/envelope component count mismatch");
+        }
+
+        // Components: hash-check the ciphertext, decrypt, re-check the
+        // plaintext hash from the private manifest, then enumerate imports.
+        let component_entries: Vec<_> = directory
+            .iter()
+            .filter(|e| e.tag == layout::TAG_COMPONENT)
+            .collect();
+        if component_entries.len() != envelope.components.len() {
+            bail!(
+                "component count mismatch: directory {}, envelope {}",
+                component_entries.len(),
+                envelope.components.len()
+            );
+        }
+        let mut component_ct_hashes = Vec::with_capacity(envelope.components.len());
+        let mut component_imports = Vec::with_capacity(envelope.components.len());
+        for (i, section) in envelope.components.iter().enumerate() {
+            let e = component_entries[i];
+            let ct = source.read_at(e.offset, e.length)?;
+            let h = payload::chunk_hash(&ct);
+            if h != section.hash || e.hash != decode_hash(&h)? {
+                bail!("sealed component {i} hash mismatch");
+            }
+            let component_key = crypto::section_key(&content_key, &format!("component/{i}"));
+            let plain = crypto::open_chunk(&component_key, 0, &ct)?;
+            if payload::chunk_hash(&plain) != private.components[i].hash {
+                bail!(
+                    "component '{}' plaintext hash mismatch",
+                    private.components[i].name
+                );
+            }
+            component_ct_hashes.push(h);
+            component_imports
+                .push(enumerate_imports(&plain).context("admission: enumerate imports")?);
+        }
+
+        // Payload blob: one ciphertext section; lazy per-chunk verify+decrypt
+        // on read.
+        let payload_entries: Vec<_> = directory
+            .iter()
+            .filter(|e| e.tag == layout::TAG_PAYLOAD)
+            .collect();
+        if payload_entries.len() != 1 {
+            bail!("sealed artifact must carry exactly one payload blob");
+        }
+        let blob_entry = payload_entries[0];
+        let payload_ref = &private.payloads[0];
+        let padded_length = payload_ref
+            .padded_length
+            .context("sealed payload ref misses padded_length")?;
+        if payload::chunk_count(padded_length) != payload_ref.chunks.len() as u64 {
+            bail!("payload chunk hash count mismatch");
+        }
+        let blob_len =
+            padded_length + payload_ref.chunks.len() as u64 * crypto::AEAD_TAG_LEN as u64;
+        if blob_entry.length != blob_len || blob_entry.length != envelope.payload.length {
+            bail!("payload blob length mismatch");
+        }
+        // The blob's bytes verify lazily, per ciphertext chunk, on first read
+        // (the whole-blob hash is checked by the eager `verify` path only);
+        // the directory entry must still agree with the envelope.
+        let blob_hash = envelope.payload.hash.clone();
+        if blob_entry.hash != decode_hash(&blob_hash)? {
+            bail!("payload blob directory hash mismatch");
+        }
+
+        // Payload tree structure and access scopes check against the private
+        // manifest alone; payload bytes verify per chunk on first read.
+        let payload_root = &payload_ref.root;
+        payload::verify_tree(payload_root)?;
+        for comp in &private.components {
+            for scope in &comp.access {
+                let node = payload::find(payload_root, &scope.path)
+                    .with_context(|| format!("access scope '{}' not found", scope.path))?;
+                if node.hash != scope.hash {
+                    bail!("access scope '{}' hash mismatch", scope.path);
+                }
+            }
+        }
+
+        // Root identity over the stored (ciphertext) sections.
+        let root_hash = identity::root_hash(
+            &envelope_hash,
+            &interface_hash,
+            &component_ct_hashes,
+            &blob_hash,
+        )?;
+        if root_hash != header.root_hash {
+            bail!("root hash mismatch");
+        }
+
+        // Signature over the ciphertext root hash (Encrypt-then-Sign).
+        if header.flags & layout::FLAG_SIGNED != 0 {
+            let sig_entry = directory
+                .iter()
+                .find(|e| e.tag == layout::TAG_SIGNATURE)
+                .context("signed artifact has no signature directory entry")?;
+            let sig_bytes = source.read_at(sig_entry.offset, sig_entry.length)?;
+            if sig_bytes.len() != 96 {
+                bail!(
+                    "signature section has unexpected length {}",
+                    sig_bytes.len()
+                );
+            }
+            if !payload::verify_signature(&sig_bytes[..32], &sig_bytes[32..], &root_hash) {
+                bail!("invalid signature");
+            }
+        }
+
+        // Synthesize the plaintext manifest view the rest of the runtime (and
+        // the host ABI) works against.
+        let manifest = manifest::Manifest {
+            name: private.name.clone(),
+            version: private.version.clone(),
+            format_version: envelope.format_version,
+            interface: envelope.interface.clone(),
+            components: private
+                .components
+                .iter()
+                .enumerate()
+                .map(|(i, c)| manifest::ComponentRef {
+                    name: c.name.clone(),
+                    world: c.world.clone(),
+                    length: envelope.components[i].length,
+                    hash: envelope.components[i].hash.clone(),
+                    exports: c.exports.clone(),
+                    access: c.access.clone(),
+                })
+                .collect(),
+            capabilities: envelope.capabilities.clone(),
+            execution: envelope.execution.clone(),
+            resources: envelope.resources.clone(),
+            policy: envelope.policy.clone(),
+            provenance: private.provenance.clone(),
+            payloads: private.payloads.clone(),
+            hashes: manifest::SectionHashes {
+                interface: envelope.interface.hash.clone(),
+                wasm: envelope.components.iter().map(|c| c.hash.clone()).collect(),
+                payload: vec![envelope.payload.hash.clone()],
+            },
+        };
+
+        let mut file_starts = HashMap::new();
+        let mut at = 0u64;
+        let mut file_list = Vec::new();
+        payload::collect_files(&manifest.payloads[0].root, "", &mut file_list);
+        for (path, _hash, len) in &file_list {
+            file_starts.insert(path.clone(), (at, *len));
+            at += len;
+        }
+        if at != payload_ref.length {
+            bail!("payload real length mismatch");
+        }
+
+        // Admission: identical policy gates to the plaintext path.
+        caf_security::check_policy_supported(&manifest.policy)
+            .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
+        caf_security::check_execution_profile(&manifest.execution)
+            .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
+        for (comp, imports) in private.components.iter().zip(&component_imports) {
+            caf_security::resolve_imports(&manifest.policy, imports).map_err(|e| {
+                anyhow::anyhow!("admission rejected for component '{}': {e}", comp.name)
+            })?;
+        }
+
+        let sealed = SealedState {
+            content_key,
+            blob_offset: blob_entry.offset,
+            padded_length,
+            ct_chunk_hashes: payload_ref.chunks.clone(),
+            file_starts,
+            component_plaintext_hashes: private.components.iter().map(|c| c.hash.clone()).collect(),
+        };
+
+        Ok(Self {
+            source,
+            header,
+            manifest,
+            directory,
+            sealed: Some(sealed),
             chunk_cache: Mutex::new(ChunkCache::new()),
         })
     }
@@ -384,6 +689,13 @@ impl Artifact {
         if len == 0 {
             return Ok((Vec::new(), 0));
         }
+
+        // Sealed artifact: `offset` is the file's start within the plaintext
+        // blob; covering ciphertext chunks are hash-verified, then decrypted.
+        if let Some(sealed) = &self.sealed {
+            return self.read_sealed_range(sealed, offset, pos, len);
+        }
+
         let node = payload::find(&self.manifest.payloads[0].root, path)
             .with_context(|| format!("payload '{path}' not in tree"))?;
 
@@ -421,6 +733,77 @@ impl Artifact {
         }
     }
 
+    /// Read a range of a sealed payload blob: fetch each covering ciphertext
+    /// chunk, verify it against the chunk hashes from the private manifest,
+    /// decrypt, and slice out the window. Padding is never served (the caller
+    /// bounds-checked against the real file length).
+    fn read_sealed_range(
+        &self,
+        sealed: &SealedState,
+        file_start: u64,
+        pos: u64,
+        len: u64,
+    ) -> Result<(Vec<u8>, u64)> {
+        let abs_start = file_start + pos;
+        let abs_end = abs_start + len;
+        let chunk_size = manifest::CHUNK_SIZE as u64;
+        let first = abs_start / chunk_size;
+        let last = (abs_end - 1) / chunk_size;
+        let mut out = Vec::with_capacity(usize::try_from(len).context("length out of range")?);
+        let mut fetched = 0u64;
+        let mut index = first;
+        while index <= last {
+            let chunk = self.fetch_chunk_sealed(sealed, index, &mut fetched)?;
+            let chunk_base = index * chunk_size;
+            let from =
+                usize::try_from(abs_start.saturating_sub(chunk_base)).context("offset range")?;
+            let remaining = usize::try_from(len).context("length out of range")? - out.len();
+            let take = (chunk.len() - from).min(remaining);
+            out.extend_from_slice(&chunk[from..from + take]);
+            index += 1;
+        }
+        Ok((out, fetched))
+    }
+
+    /// Fetch ciphertext chunk `index` of a sealed payload blob, hash-verify,
+    /// decrypt, and cache the plaintext (LRU, keyed by ciphertext offset).
+    fn fetch_chunk_sealed(
+        &self,
+        sealed: &SealedState,
+        index: u64,
+        fetched: &mut u64,
+    ) -> Result<Vec<u8>> {
+        let chunk_size = manifest::CHUNK_SIZE as u64;
+        let plain_len = chunk_size.min(sealed.padded_length - index * chunk_size);
+        let ct_off = sealed.blob_offset + index * (chunk_size + crypto::AEAD_TAG_LEN as u64);
+        let ct_len = plain_len + crypto::AEAD_TAG_LEN as u64;
+        {
+            let mut cache = self
+                .chunk_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("chunk cache lock poisoned"))?;
+            if let Some(data) = cache.get(ct_off) {
+                return Ok(data);
+            }
+        }
+        let ct = self.source.read_at(ct_off, ct_len)?;
+        *fetched += ct_len;
+        let expected = sealed
+            .ct_chunk_hashes
+            .get(usize::try_from(index).context("chunk index out of range")?)
+            .context("chunk hash missing")?;
+        if &payload::chunk_hash(&ct) != expected {
+            bail!("payload chunk {index} ciphertext hash mismatch");
+        }
+        let payload_key = crypto::section_key(&sealed.content_key, "payload");
+        let plain = crypto::open_chunk(&payload_key, index, &ct)?;
+        self.chunk_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chunk cache lock poisoned"))?
+            .insert(ct_off, plain.clone());
+        Ok(plain)
+    }
+
     /// Fetch `[chunk_off, chunk_off + len)` from the backing store and verify
     /// the bytes against `expected_hash`. Verified chunks are served from a
     /// bounded LRU cache; only cache misses pull from the store (and are the
@@ -454,6 +837,11 @@ impl Artifact {
     }
 
     fn payload_map(&self) -> Result<HashMap<String, (u64, u64)>> {
+        // Sealed artifact: paths map into the plaintext blob (offset, real
+        // length); decryption happens in the read path.
+        if let Some(sealed) = &self.sealed {
+            return Ok(sealed.file_starts.clone());
+        }
         let mut files = Vec::new();
         payload::collect_files(&self.manifest.payloads[0].root, "", &mut files);
         let entries: Vec<_> = self
@@ -490,6 +878,16 @@ impl Artifact {
         let comp = &self.manifest.components[index];
         if payload::chunk_hash(&data) != comp.hash {
             bail!("component '{}' hash mismatch", comp.name);
+        }
+        // Sealed artifact: `data` is the ciphertext section; decrypt and check
+        // the plaintext hash from the private manifest.
+        if let Some(sealed) = &self.sealed {
+            let key = crypto::section_key(&sealed.content_key, &format!("component/{index}"));
+            let plain = crypto::open_chunk(&key, 0, &data)?;
+            if payload::chunk_hash(&plain) != sealed.component_plaintext_hashes[index] {
+                bail!("component '{}' plaintext hash mismatch", comp.name);
+            }
+            return Ok(plain);
         }
         Ok(data)
     }

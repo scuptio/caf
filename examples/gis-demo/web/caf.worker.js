@@ -14,7 +14,7 @@ self.onmessage = async (e) => {
   try {
     let value;
     if (op === "open") {
-      artifact = await CAF.openCaf(e.data.source);
+      artifact = await CAF.openCaf(e.data.source, e.data.options ?? {});
       comp = await artifact.instantiate(e.data.component ?? 0);
       value = {
         name: artifact.name,
