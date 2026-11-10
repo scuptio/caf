@@ -109,14 +109,21 @@ pub fn convergent_content_key(seed: &[u8; 32], plaintext_identity: &[u8]) -> [u8
     kdf("content", &ikm)
 }
 
-/// Deterministic ephemeral secret for one recipient (convergent builds only).
+/// Deterministic ephemeral secret for one recipient and content key
+/// (convergent builds only). Binding the content key prevents reuse of the
+/// wrapping key with nonce zero across different wrapped plaintexts.
 /// Loops over a domain counter so the result always lands in the P-256 group.
-pub fn convergent_ephemeral(seed: &[u8; 32], recipient: &PublicKey) -> Result<SecretKey> {
+pub fn convergent_ephemeral(
+    seed: &[u8; 32],
+    recipient: &PublicKey,
+    content_key: &[u8; 32],
+) -> Result<SecretKey> {
     let recipient_point = recipient.to_encoded_point(false);
     let recipient_bytes = recipient_point.as_bytes();
     for counter in 0u8..=u8::MAX {
         let mut ikm = Vec::with_capacity(seed.len() + recipient_bytes.len() + 1);
         ikm.extend_from_slice(seed);
+        ikm.extend_from_slice(content_key);
         ikm.extend_from_slice(recipient_bytes);
         ikm.push(counter);
         if let Ok(secret) = SecretKey::from_slice(&kdf("keybox-eph", &ikm)) {

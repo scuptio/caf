@@ -267,15 +267,41 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
     let padded = crypto::padded_len(real_len);
     blob_plain.resize(padded as usize, 0);
 
+    // Private manifest: everything the envelope hides.
+    let mut private = PrivateManifest {
+        name: cfg.name.clone(),
+        version: cfg.version.clone(),
+        components: p
+            .components
+            .refs
+            .iter()
+            .map(|c| PrivateComponent {
+                name: c.name.clone(),
+                world: c.world.clone(),
+                hash: c.hash.clone(),
+                exports: c.exports.clone(),
+                access: c.access.clone(),
+            })
+            .collect(),
+        provenance: provenance(cfg),
+        payloads: vec![PayloadRef {
+            root: p.payload_root.clone(),
+            media_type: cfg.payload.media_type.clone(),
+            length: real_len,
+            hash: sha256_hex(&blob_plain),
+            compressed: None,
+            padded_length: Some(padded),
+            chunks: Vec::new(),
+        }],
+    };
+
     // Content key: convergent (reproducible) when key_seed is set, else random.
     let content_key: [u8; 32] = match seed {
         Some(seed) => {
-            let mut identity_input = Vec::new();
-            identity_input.extend_from_slice(&decode_hash(&p.interface_hash)?);
-            for h in &p.components.hashes {
-                identity_input.extend_from_slice(&decode_hash(h)?);
-            }
-            identity_input.extend_from_slice(&decode_hash(&p.payload_root.hash)?);
+            // Bind every private metadata field and every encrypted plaintext
+            // before encryption. Ciphertext refs above are placeholders here,
+            // avoiding a circular dependency on the derived content key.
+            let identity_input = cbor_bytes(&(&p.interface_hash, &private))?;
             crypto::convergent_content_key(&seed, &sha256_raw(&identity_input))
         }
         None => {
@@ -308,33 +334,9 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         component_cts.push(ct);
     }
 
-    // Private manifest: everything the envelope hides.
-    let private = PrivateManifest {
-        name: cfg.name.clone(),
-        version: cfg.version.clone(),
-        components: p
-            .components
-            .refs
-            .iter()
-            .map(|c| PrivateComponent {
-                name: c.name.clone(),
-                world: c.world.clone(),
-                hash: c.hash.clone(),
-                exports: c.exports.clone(),
-                access: c.access.clone(),
-            })
-            .collect(),
-        provenance: provenance(cfg),
-        payloads: vec![PayloadRef {
-            root: p.payload_root.clone(),
-            media_type: cfg.payload.media_type.clone(),
-            length: real_len,
-            hash: blob_hash.clone(),
-            compressed: None,
-            padded_length: Some(padded),
-            chunks: blob_chunk_hashes,
-        }],
-    };
+    // Replace the plaintext identity placeholders with stored ciphertext refs.
+    private.payloads[0].hash = blob_hash.clone();
+    private.payloads[0].chunks = blob_chunk_hashes;
     let private_bytes = cbor_bytes(&private)?;
     let private_key = crypto::section_key(&content_key, "private");
     let private_ct = crypto::seal_chunk(&private_key, 0, &private_bytes)?;
@@ -345,7 +347,7 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
     let mut stanzas = Vec::with_capacity(recipients.len());
     for recipient in &recipients {
         let ephemeral = match seed {
-            Some(seed) => crypto::convergent_ephemeral(&seed, recipient)?,
+            Some(seed) => crypto::convergent_ephemeral(&seed, recipient, &content_key)?,
             None => p256::SecretKey::random(&mut rand_core::OsRng),
         };
         stanzas.push(crypto::wrap_content_key(
@@ -567,7 +569,17 @@ fn provenance(cfg: &Config) -> Provenance {
 fn collect_capabilities(cfg: &Config) -> Result<Vec<CapabilityId>> {
     let mut out: Vec<CapabilityId> = Vec::new();
     for cap in &cfg.capabilities {
-        out.push(CapabilityId::parse(cap).map_err(anyhow::Error::msg)?);
+        let parsed = CapabilityId::parse(cap).map_err(anyhow::Error::msg)?;
+        if !cfg
+            .components
+            .iter()
+            .any(|c| c.capabilities.iter().any(|bound| bound == cap))
+        {
+            bail!("artifact capability '{cap}' has no implementing component");
+        }
+        if !out.contains(&parsed) {
+            out.push(parsed);
+        }
     }
     for c in &cfg.components {
         for cap in &c.capabilities {
@@ -637,10 +649,18 @@ fn build_components(
         let exports = match (wit.as_ref(), world) {
             (Some(w), Some(world)) => {
                 let world_exports = wit::exports(w, world);
-                check_abi_bridge(&c.name, &blob, &world_exports)?;
-                bind_capabilities(&c.capabilities, &world_exports)?
+                bind_capabilities(&c.name, &blob, &c.capabilities, &world_exports)?
             }
-            _ => exports::extract_exports(&blob),
+            _ => {
+                if !c.capabilities.is_empty() {
+                    bail!(
+                        "component '{}' declares capabilities without a WIT world",
+                        c.name
+                    );
+                }
+                exports::core_exports(&blob)?;
+                exports::extract_exports(&blob)
+            }
         };
 
         let mut access = Vec::with_capacity(c.access.len());
@@ -669,11 +689,18 @@ fn build_components(
     Ok(out)
 }
 
+/// Every capability recorded in the manifest must be callable with its
+/// declared caf-abi signature. Unbound world exports are not advertised.
 fn bind_capabilities(
+    component_name: &str,
+    wasm: &[u8],
     capabilities: &[String],
     world_exports: &[wit::WorldExport],
 ) -> Result<Vec<ExportEntry>> {
-    let mut out = Vec::with_capacity(capabilities.len());
+    let actual =
+        exports::core_exports(wasm).with_context(|| format!("component '{component_name}'"))?;
+    let mut out = Vec::new();
+    let mut needs_bridge = false;
     for cap_str in capabilities {
         let cap = CapabilityId::parse(cap_str).map_err(anyhow::Error::msg)?;
         let we = world_exports
@@ -681,66 +708,45 @@ fn bind_capabilities(
             .find(|w| w.name == cap.name)
             .with_context(|| format!("capability '{cap_str}' has no matching world export"))?;
         for f in &we.functions {
+            let (name, signature) = actual.functions.get(&f.name)
+                .with_context(|| format!("component '{component_name}' capability '{cap_str}' is missing WASM function '{}'", f.name))?;
+            if signature != &f.core_type {
+                bail!(
+                    "component '{component_name}' export '{name}' signature mismatch: expected {:?}, got {:?}",
+                    f.core_type,
+                    signature
+                );
+            }
+            needs_bridge |= f.needs_bridge;
             out.push(ExportEntry {
                 capability: cap.to_string(),
-                export: f.name.clone(),
+                export: name.clone(),
                 signature: f.signature.clone(),
             });
         }
     }
+    if needs_bridge {
+        if !actual.memory32 {
+            bail!(
+                "component '{component_name}' caf-abi memory bridge requires an exported, unshared 32-bit 'memory'"
+            );
+        }
+        use wasmparser::{FuncType, ValType::I32};
+        for (name, expected) in [
+            ("alloc", FuncType::new([I32], [I32])),
+            ("dealloc", FuncType::new([I32, I32], [])),
+        ] {
+            let (_, signature) = actual.functions.get(name).with_context(|| {
+                format!("component '{component_name}' caf-abi memory bridge is missing '{name}'")
+            })?;
+            if signature != &expected {
+                bail!(
+                    "component '{component_name}' caf-abi memory bridge '{name}' signature mismatch: expected {expected:?}, got {signature:?}"
+                );
+            }
+        }
+    }
     Ok(out)
-}
-
-/// caf-abi v1 enforcement: a component that actually exports a WIT function
-/// needing the memory bridge (complex params/results) must export `alloc` and
-/// `dealloc`. Binding is by convention in v1, so matching is name-based
-/// (kebab-case WIT ↔ snake_case wasm); complex WIT functions without a
-/// matching wasm export only warn — they may be intentionally unbound.
-fn check_abi_bridge(
-    component_name: &str,
-    wasm: &[u8],
-    world_exports: &[wit::WorldExport],
-) -> Result<()> {
-    let complex: Vec<&str> = world_exports
-        .iter()
-        .flat_map(|we| we.functions.iter())
-        .filter(|f| f.needs_bridge)
-        .map(|f| f.name.as_str())
-        .collect();
-    if complex.is_empty() {
-        return Ok(());
-    }
-    let wasm_exports: Vec<String> = exports::extract_exports(wasm)
-        .into_iter()
-        .map(|e| e.export.replace('_', "-"))
-        .collect();
-    let bound: Vec<&str> = complex
-        .into_iter()
-        .filter(|f| wasm_exports.iter().any(|e| e == f))
-        .collect();
-    if bound.is_empty() {
-        eprintln!(
-            "warning: component '{component_name}' has complex WIT exports but none match wasm \
-             export names; caf-abi memory-bridge check skipped"
-        );
-        return Ok(());
-    }
-    let has_alloc = wasm_exports.iter().any(|e| e == "alloc");
-    let has_dealloc = wasm_exports.iter().any(|e| e == "dealloc");
-    if !has_alloc || !has_dealloc {
-        let missing = match (has_alloc, has_dealloc) {
-            (false, false) => "alloc and dealloc",
-            (false, true) => "alloc",
-            (true, false) => "dealloc",
-            (true, true) => unreachable!(),
-        };
-        anyhow::bail!(
-            "component '{component_name}' exports complex-typed function(s) [{}] via the caf-abi \
-             memory bridge but is missing {missing} — see doc/spec/caf-abi.md §3",
-            bound.join(", ")
-        );
-    }
-    Ok(())
 }
 
 fn collect_payload_blobs(

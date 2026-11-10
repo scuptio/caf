@@ -47,12 +47,8 @@ mv interfaces/gis-demo.wit interfaces/gis.wit
 package cf:gis@0.1.0;
 
 interface spatial-transform {
-  record point {
-    x: f64,
-    y: f64,
-  }
-
-  reproject: func(x: f64, y: f64, from-code: u32, to-code: u32) -> point;
+  reproject-x: func(x: f64, y: f64, from-code: u32, to-code: u32) -> f64;
+  reproject-y: func(x: f64, y: f64, from-code: u32, to-code: u32) -> f64;
 }
 
 world projection {

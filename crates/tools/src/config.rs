@@ -38,8 +38,10 @@ pub struct EncryptConfig {
     /// keybox stanza is emitted per recipient.
     pub recipients: Vec<String>,
     /// Optional 32-byte seed (hex) for **convergent** builds: the content key
-    /// and keybox ephemerals are derived from the seed and the plaintext
-    /// identity, so identical inputs reproduce identical ciphertext. Omit it
+    /// is derived from the seed and complete plaintext/private metadata
+    /// identity. Keybox ephemerals also bind the resulting content key, so
+    /// identical inputs reproduce identical ciphertext without nonce reuse
+    /// across distinct plaintexts. Omit it
     /// for a fresh random content key per build.
     #[serde(default)]
     pub key_seed: Option<String>,

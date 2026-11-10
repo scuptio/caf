@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::{assemble, config, wizard};
@@ -28,7 +28,8 @@ fn write_config_impl(dir: &Path, access: &[&str], seed: Option<&str>) -> Result<
         Some(s) => format!("\n[sign]\nseed = \"{s}\"\n"),
         None => String::new(),
     };
-    write_config_full(dir, access, b"\0asm\x01\0\0\0", &extra)
+    write_config_full(dir, access, &wasm_with_bridge(), &extra)?;
+    bind_test_capabilities(dir, &["cf:metadata@1", "cf:spatial-query@1"])
 }
 
 /// Full control over the component bytes and any extra TOML sections
@@ -40,7 +41,7 @@ fn write_config_full(dir: &Path, access: &[&str], wasm: &[u8], extra: &str) -> R
         .collect::<Vec<_>>()
         .join(", ");
     let toml = format!(
-        "name = \"city\"\nversion = \"0.1.0\"\n\ninterfaces = [\"spatial.wit\"]\n\n[payload]\nroot = \"payload\"\nmedia_type = \"application/x-spatial\"\n\n[[components]]\nname = \"spatial\"\nworld = \"spatial-file\"\npath = \"spatial.wasm\"\ncapabilities = [\"cf:metadata@1\", \"cf:spatial-query@1\"]\naccess = [{access}]\n{extra}"
+        "name = \"city\"\nversion = \"0.1.0\"\n\ninterfaces = [\"spatial.wit\"]\n\n[payload]\nroot = \"payload\"\nmedia_type = \"application/x-spatial\"\n\n[[components]]\nname = \"spatial\"\nworld = \"spatial-file\"\npath = \"spatial.wasm\"\ncapabilities = []\naccess = [{access}]\n{extra}"
     );
     std::fs::write(dir.join("build.toml"), toml)?;
     std::fs::write(
@@ -50,6 +51,22 @@ fn write_config_full(dir: &Path, access: &[&str], wasm: &[u8], extra: &str) -> R
     std::fs::write(dir.join("spatial.wasm"), wasm)?;
     std::fs::write(dir.join("payload/data/city.parquet"), b"parquet-bytes")?;
     std::fs::write(dir.join("payload/index/rtree.bin"), b"index-bytes")?;
+    Ok(())
+}
+
+/// Explicitly bind capabilities only in fixtures that implement their WIT.
+fn bind_test_capabilities(dir: &Path, caps: &[&str]) -> Result<()> {
+    let path = dir.join("build.toml");
+    let config = std::fs::read_to_string(&path)?;
+    let caps = caps
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        path,
+        config.replace("capabilities = []", &format!("capabilities = [{caps}]")),
+    )?;
     Ok(())
 }
 
@@ -469,7 +486,14 @@ fn wizard_scaffolds_and_builds() -> Result<()> {
 
     wizard::scaffold("demo", wizard::Language::Rust, &dir)?;
     let proj = dir.join("demo");
-    std::fs::write(proj.join("demo.wasm"), b"\0asm\x01\0\0\0")?;
+    let mut wasm = wasm_with_bridge();
+    // Rename the fixture's complex result function to the scaffold's ping.
+    let name = wasm
+        .windows(4)
+        .position(|w| w == b"name")
+        .context("fixture name")?;
+    wasm[name..name + 4].copy_from_slice(b"ping");
+    std::fs::write(proj.join("demo.wasm"), wasm)?;
 
     let (cfg, base) = config::load(&proj.join("build.toml"))?;
     let built = assemble::assemble(&cfg, &base)?;
@@ -653,8 +677,9 @@ fn wasm_with_bridge() -> Vec<u8> {
     // memory: min 1 page
     wasm.extend(wasm_section(5, &[0x01, 0x00, 0x01]));
     // exports: name=f0, memory, alloc=f1, dealloc=f2
-    let mut exports = vec![0x04];
+    let mut exports = vec![0x05];
     exports.extend(b"\x04name\x00\x00");
+    exports.extend(b"\x05query\x00\x00");
     exports.extend(b"\x06memory\x02\x00");
     exports.extend(b"\x05alloc\x00\x01");
     exports.extend(b"\x07dealloc\x00\x02");
@@ -683,6 +708,7 @@ fn build_rejects_complex_export_without_memory_bridge() -> Result<()> {
     wasm.extend(wasm_section(10, &[0x01, 0x04, 0x00, 0x42, 0x00, 0x0b]));
 
     write_config_full(&dir, &["/data"], &wasm, "")?;
+    bind_test_capabilities(&dir, &["cf:metadata@1"])?;
     let err = match build_bytes(&dir) {
         Ok(_) => return Err(anyhow::anyhow!("build unexpectedly succeeded")),
         Err(e) => e,
@@ -697,6 +723,7 @@ fn build_rejects_complex_export_without_memory_bridge() -> Result<()> {
 fn build_accepts_complex_export_with_memory_bridge() -> Result<()> {
     let dir = temp_root("abi-ok")?;
     write_config_full(&dir, &["/data"], &wasm_with_bridge(), "")?;
+    bind_test_capabilities(&dir, &["cf:metadata@1", "cf:spatial-query@1"])?;
     let bytes = build_bytes(&dir)?;
     verify::verify_bytes(&bytes)?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -706,8 +733,7 @@ fn build_accepts_complex_export_with_memory_bridge() -> Result<()> {
 #[test]
 fn scalar_only_exports_need_no_bridge() -> Result<()> {
     let dir = temp_root("abi-scalar")?;
-    // `query` is complex in the WIT, but this module exports only `answer`,
-    // which is scalar-shaped and unbound — no bridge required.
+    // A bound scalar WIT function requires no memory bridge.
     let mut wasm = b"\0asm\x01\0\0\0".to_vec();
     wasm.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x01, 0x7f]));
     wasm.extend(wasm_section(3, &[0x01, 0x00]));
@@ -716,6 +742,11 @@ fn scalar_only_exports_need_no_bridge() -> Result<()> {
     wasm.extend(wasm_section(7, &exports));
     wasm.extend(wasm_section(10, &[0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b]));
     write_config_full(&dir, &["/data"], &wasm, "")?;
+    std::fs::write(
+        dir.join("spatial.wit"),
+        "package cf:gis@0.1.0; world spatial-file { export answer: func() -> u32; }",
+    )?;
+    bind_test_capabilities(&dir, &["cf:answer@1"])?;
     build_bytes(&dir)?;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
@@ -991,5 +1022,394 @@ fn trust_store_loads_and_matches() -> Result<()> {
     );
     assert!(!store.keys.contains_key("def456"));
     let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+fn stored_section(bytes: &[u8], tag: u8) -> Result<&[u8]> {
+    let header = layout::read_header(bytes)?;
+    let entries = layout::decode_directory(layout::slice(
+        bytes,
+        header.directory_offset,
+        header.directory_len,
+    )?)?;
+    let entry = entries
+        .iter()
+        .find(|e| e.tag == tag)
+        .context("missing section")?;
+    layout::slice(bytes, entry.offset, entry.length)
+}
+
+#[test]
+fn convergent_builds_rotate_keys_for_metadata_and_content_changes() -> Result<()> {
+    let (secret, public) = recipient_keypair();
+    let dir = temp_root("convergent-key-rotation")?;
+    write_sealed_config(&dir, &["/data"], &public, Some(&"77".repeat(32)), None)?;
+    let (cfg, base) = config::load(&dir.join("build.toml"))?;
+    let original = assemble::assemble(&cfg, &base)?;
+    let old_key = original.content_key.context("content key")?;
+    let old_stanza = &stored_section(&original.bytes, layout::TAG_KEYBOX)?[4..];
+    for change in 0..6 {
+        let (mut cfg, base) = config::load(&dir.join("build.toml"))?;
+        match change {
+            0 => cfg.version = "0.2.0".into(),
+            1 => cfg.name = "renamed".into(),
+            2 => cfg.payload.media_type = "application/new-type".into(),
+            3 => cfg.components[0].name = "renamed-component".into(),
+            4 => cfg.components[0].access = vec!["/index".into()],
+            _ => std::fs::write(dir.join("payload/data/city.parquet"), b"new payload")?,
+        }
+        let changed = assemble::assemble(&cfg, &base)?;
+        let new_key = changed.content_key.context("new content key")?;
+        assert_ne!(
+            old_key, new_key,
+            "change {change} must rotate the content key"
+        );
+        let new_stanza = &stored_section(&changed.bytes, layout::TAG_KEYBOX)?[4..];
+        assert_ne!(
+            &old_stanza[..65],
+            &new_stanza[..65],
+            "wrapping ephemeral must rotate"
+        );
+        // The former attack recovered the new key using the known old key.
+        let recovered: Vec<_> = old_stanza[77..109]
+            .iter()
+            .zip(&new_stanza[77..109])
+            .zip(old_key)
+            .map(|((a, b), key)| a ^ b ^ key)
+            .collect();
+        assert_ne!(recovered.as_slice(), new_key.as_slice());
+        assert_eq!(
+            caf_core::crypto::unwrap_artifact(&changed.bytes, &secret)?,
+            Some(new_key)
+        );
+        verify::verify_bytes_keyed(&changed.bytes, Some(&new_key))?;
+        assert!(
+            caf_core::crypto::open_chunk(
+                &caf_core::crypto::section_key(&old_key, "private"),
+                0,
+                stored_section(&changed.bytes, layout::TAG_PRIVATE)?,
+            )
+            .is_err()
+        );
+        assert_eq!(changed.bytes, assemble::assemble(&cfg, &base)?.bytes);
+    }
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+/// Probe opens a payload file and reads one byte. Calling it again must not
+/// make a previously denied read succeed through the chunk cache.
+fn read_probe_wasm() -> Vec<u8> {
+    read_probe_wasm_len(1, 1)
+}
+
+fn read_probe_wasm_len(read_len: u32, memory_pages: u8) -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(
+        1,
+        &[
+            3, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 0, 1, 0x7f,
+        ],
+    ));
+    wasm.extend(wasm_section(
+        2,
+        b"\x02\x03caf\x04open\x00\x00\x03caf\x04read\x00\x01",
+    ));
+    wasm.extend(wasm_section(3, &[1, 2]));
+    wasm.extend(wasm_section(5, &[1, 0, memory_pages]));
+    wasm.extend(wasm_section(7, b"\x02\x06memory\x02\x00\x05probe\x00\x02"));
+    let mut body = vec![0, 0x41, 16, 0x41, 18, 0x10, 0, 0x41, 0, 0x41];
+    let mut value = read_len;
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = value == 0 && byte & 0x40 == 0;
+        body.push(if done { byte } else { byte | 0x80 });
+        if done {
+            break;
+        }
+    }
+    body.extend([0x10, 1, 0x0b]);
+    let mut code = vec![1, body.len() as u8];
+    code.extend(body);
+    wasm.extend(wasm_section(10, &code));
+    let path = b"/data/city.parquet";
+    let mut data = vec![1, 0, 0x41, 16, 0x0b, path.len() as u8];
+    data.extend(path);
+    wasm.extend(wasm_section(11, &data));
+    wasm
+}
+
+#[test]
+fn read_budget_is_reserved_before_io_for_plain_and_sealed_payloads() -> Result<()> {
+    for sealed in [false, true] {
+        let dir = temp_root(if sealed {
+            "sealed-read-budget"
+        } else {
+            "read-budget"
+        })?;
+        if sealed {
+            let (_, public) = recipient_keypair();
+            write_sealed_config(&dir, &["/data"], &public, Some(&"88".repeat(32)), None)?;
+            std::fs::write(dir.join("spatial.wasm"), read_probe_wasm())?;
+        } else {
+            write_config_full(&dir, &["/data"], &read_probe_wasm(), "")?;
+        }
+        for limit in [0, 1, 13, 4112] {
+            let (mut cfg, base) = config::load(&dir.join("build.toml"))?;
+            cfg.resources.read_max = limit;
+            let built = assemble::assemble(&cfg, &base)?;
+            let source = std::sync::Arc::new(CountingSource::new(built.bytes));
+            let artifact = std::sync::Arc::new(match built.content_key {
+                Some(key) => caf_runtime::Artifact::open_source_with_key(source.clone(), &key)?,
+                None => caf_runtime::Artifact::open_source(source.clone())?,
+            });
+            let mut session = caf_runtime::instantiate(&artifact, "spatial")?;
+            let before = source.bytes_read();
+            let cost = if sealed { 4112 } else { 13 };
+            for _ in 0..3 {
+                let result = session.call("probe", &[])?;
+                assert!(
+                    matches!(result[0], caf_runtime::Val::I32(v) if v == if limit >= cost { 1 } else { -1 })
+                );
+            }
+            assert_eq!(
+                source.bytes_read() - before,
+                if limit >= cost { cost } else { 0 }
+            );
+            assert_eq!(session.usage().read, if limit >= cost { cost } else { 0 });
+        }
+        std::fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+fn host_memory_probe(import: &str) -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[1, 0x60, 2, 0x7f, 0x7f, 1, 0x7f]));
+    let mut imports = vec![1, 3, b'c', b'a', b'f', import.len() as u8];
+    imports.extend(import.as_bytes());
+    imports.extend([0, 0]);
+    wasm.extend(wasm_section(2, &imports));
+    wasm.extend(wasm_section(5, &[1, 0, 1]));
+    wasm.extend(wasm_section(7, b"\x02\x06memory\x02\x00\x05probe\x00\x00"));
+    wasm
+}
+
+#[test]
+fn guest_memory_ranges_are_checked_before_copying_or_charging_output() -> Result<()> {
+    let dir = temp_root("guest-memory-bounds")?;
+    for import in ["open", "emit", "log"] {
+        write_config_full(
+            &dir,
+            &["/data"],
+            &host_memory_probe(import),
+            "\n[resources]\nmemory_max = 65536\noutput_max = 8\n",
+        )?;
+        let artifact = std::sync::Arc::new(caf_runtime::Artifact::open(build_bytes(&dir)?)?);
+        for (ptr, len) in [(0, i32::MAX), (65535, 2), (-1, 1), (0, -1)] {
+            let mut session = caf_runtime::instantiate(&artifact, "spatial")?;
+            let result = session.call(
+                "probe",
+                &[caf_runtime::Val::I32(ptr), caf_runtime::Val::I32(len)],
+            )?;
+            assert!(matches!(result[0], caf_runtime::Val::I32(-1)));
+            assert!(session.emitted().is_empty());
+            assert_eq!(session.usage().output, 4, "only the i32 result is charged");
+        }
+        let mut session = caf_runtime::instantiate(&artifact, "spatial")?;
+        assert!(session.read_memory(0, u32::MAX).is_err());
+        assert!(session.read_memory(65535, 2).is_err());
+        assert_eq!(session.usage().output, 0);
+        assert_eq!(session.read_memory(65535, 1)?, [0]);
+        assert_eq!(session.usage().output, 1);
+        if import != "open" {
+            // In-bounds output is still denied before copying if over budget.
+            let result = session.call(
+                "probe",
+                &[caf_runtime::Val::I32(0), caf_runtime::Val::I32(16)],
+            )?;
+            assert!(matches!(result[0], caf_runtime::Val::I32(-1)));
+            assert!(session.emitted().is_empty());
+            assert_eq!(session.usage().output, 5);
+        }
+    }
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn build_rejects_missing_capability_exports_and_unimplemented_artifact_capabilities() -> Result<()>
+{
+    let dir = temp_root("missing-wit-export")?;
+    write_config_full(&dir, &["/data"], b"\0asm\x01\0\0\0", "")?;
+    bind_test_capabilities(&dir, &["cf:metadata@1"])?;
+    let err = build_bytes(&dir)
+        .err()
+        .context("missing export must fail")?;
+    assert!(format!("{err:#}").contains("missing WASM function 'name'"));
+    let (mut cfg, base) = config::load(&dir.join("build.toml"))?;
+    cfg.components[0].capabilities.clear();
+    cfg.capabilities.push("cf:metadata@1".into());
+    let err = assemble::assemble(&cfg, &base)
+        .err()
+        .context("unbound capability must fail")?;
+    assert!(format!("{err:#}").contains("no implementing component"));
+    cfg.capabilities.clear();
+    cfg.components[0].capabilities.push("cf:metadata@1".into());
+    cfg.interfaces.clear();
+    let err = assemble::assemble(&cfg, &base)
+        .err()
+        .context("missing WIT must fail")?;
+    assert!(format!("{err:#}").contains("without a WIT world"));
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn build_checks_scalar_parameter_and_result_types_and_records_actual_export_name() -> Result<()> {
+    let dir = temp_root("wit-signatures")?;
+    // Actual function is (i32) -> i32, exported with a snake_case name.
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[1, 0x60, 1, 0x7f, 1, 0x7f]));
+    wasm.extend(wasm_section(3, &[1, 0]));
+    wasm.extend(wasm_section(7, b"\x01\x0bscalar_call\x00\x00"));
+    wasm.extend(wasm_section(10, &[1, 4, 0, 0x20, 0, 0x0b]));
+    write_config_full(&dir, &["/data"], &wasm, "")?;
+    bind_test_capabilities(&dir, &["cf:scalar-call@1"])?;
+    for (signature, accepted) in [
+        ("func(x: u32) -> u32", true),
+        ("func(x: f64) -> u32", false),
+        ("func(x: u32) -> u64", false),
+        ("func() -> u32", false),
+        ("func(x: u32)", false),
+    ] {
+        std::fs::write(
+            dir.join("spatial.wit"),
+            format!(
+                "package cf:gis@0.1.0; world spatial-file {{ export scalar-call: {signature}; }}"
+            ),
+        )?;
+        let built = build_bytes(&dir);
+        assert_eq!(built.is_ok(), accepted, "{signature}");
+        if let Ok(bytes) = built {
+            assert_eq!(
+                decode_manifest(&bytes)?.components[0].exports[0].export,
+                "scalar_call"
+            );
+        }
+    }
+    // Aliases, enums and flags lower to i32 as well.
+    std::fs::write(
+        dir.join("spatial.wit"),
+        "package cf:gis@0.1.0; world spatial-file { type number = u32; export scalar-call: func(x: number) -> number; }",
+    )?;
+    build_bytes(&dir)?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn build_checks_complex_parameters_memory_and_bridge_signatures() -> Result<()> {
+    let dir = temp_root("wit-complex-signatures")?;
+    let wasm = wasm_with_bridge();
+    write_config_full(&dir, &["/data"], &wasm, "")?;
+    bind_test_capabilities(&dir, &["cf:metadata@1"])?;
+    // A string parameter requires (ptr, len); name() takes no parameters.
+    std::fs::write(
+        dir.join("spatial.wit"),
+        "package cf:gis@0.1.0; world spatial-file { export metadata: interface { name: func(value: string) -> string; } }",
+    )?;
+    let err = build_bytes(&dir)
+        .err()
+        .context("complex argument mismatch must fail")?;
+    assert!(format!("{err:#}").contains("signature mismatch"));
+    write_config_full(&dir, &["/data"], &wasm, "")?;
+    bind_test_capabilities(&dir, &["cf:metadata@1"])?;
+    // Valid WASM with an alloc export of the wrong type (points at name).
+    let mut wrong_alloc = wasm.clone();
+    let at = wrong_alloc
+        .windows(7)
+        .position(|w| w == b"\x05alloc\x00")
+        .context("alloc export")?;
+    wrong_alloc[at + 7] = 0;
+    std::fs::write(dir.join("spatial.wasm"), wrong_alloc)?;
+    let err = build_bytes(&dir)
+        .err()
+        .context("wrong alloc signature must fail")?;
+    assert!(format!("{err:#}").contains("memory bridge 'alloc' signature mismatch"));
+    let mut wrong_dealloc = wasm.clone();
+    let at = wrong_dealloc
+        .windows(9)
+        .position(|w| w == b"\x07dealloc\x00")
+        .context("dealloc export")?;
+    wrong_dealloc[at + 9] = 1;
+    std::fs::write(dir.join("spatial.wasm"), wrong_dealloc)?;
+    let err = build_bytes(&dir)
+        .err()
+        .context("wrong dealloc signature must fail")?;
+    assert!(format!("{err:#}").contains("memory bridge 'dealloc' signature mismatch"));
+    let mut no_memory = wasm.clone();
+    let at = no_memory
+        .windows(6)
+        .position(|w| w == b"memory")
+        .context("memory export")?;
+    no_memory[at..at + 6].copy_from_slice(b"hidden");
+    std::fs::write(dir.join("spatial.wasm"), no_memory)?;
+    let err = build_bytes(&dir)
+        .err()
+        .context("missing memory must fail")?;
+    assert!(format!("{err:#}").contains("requires an exported"));
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn partial_and_corrupt_reads_cannot_retry_without_charging_their_io() -> Result<()> {
+    let dir = temp_root("partial-read-budget")?;
+    let length = 2 * manifest::CHUNK_SIZE + 5;
+    write_config_full(
+        &dir,
+        &["/data"],
+        &read_probe_wasm_len(length as u32, 64),
+        "",
+    )?;
+    std::fs::write(dir.join("payload/data/city.parquet"), vec![7; length])?;
+    let (mut cfg, base) = config::load(&dir.join("build.toml"))?;
+    // Two full chunks can be fetched, but the last five bytes cannot.
+    cfg.resources.read_max = (length - 1) as u64;
+    let built = assemble::assemble(&cfg, &base)?;
+    let source = std::sync::Arc::new(CountingSource::new(built.bytes));
+    let artifact = std::sync::Arc::new(caf_runtime::Artifact::open_source(source.clone())?);
+    let mut session = caf_runtime::instantiate(&artifact, "spatial")?;
+    let before = source.bytes_read();
+    for _ in 0..3 {
+        let results = session.call("probe", &[])?;
+        assert!(matches!(results[0], caf_runtime::Val::I32(-1)));
+    }
+    assert_eq!(
+        source.bytes_read() - before,
+        2 * manifest::CHUNK_SIZE as u64
+    );
+    assert_eq!(session.usage().read, 2 * manifest::CHUNK_SIZE as u64);
+    // Even a verification failure retains its reservation and never caches
+    // corrupt bytes. A second attempt cannot perform another uncharged read.
+    write_config_full(&dir, &["/data"], &read_probe_wasm(), "")?;
+    let (mut cfg, base) = config::load(&dir.join("build.toml"))?;
+    cfg.resources.read_max = 13;
+    let mut built = assemble::assemble(&cfg, &base)?;
+    let (offset, _) = payload_span(&built.bytes, 13)?;
+    built.bytes[offset as usize] ^= 1;
+    let source = std::sync::Arc::new(CountingSource::new(built.bytes));
+    let artifact = std::sync::Arc::new(caf_runtime::Artifact::open_source(source.clone())?);
+    let mut session = caf_runtime::instantiate(&artifact, "spatial")?;
+    let before = source.bytes_read();
+    for _ in 0..3 {
+        let results = session.call("probe", &[])?;
+        assert!(matches!(results[0], caf_runtime::Val::I32(-1)));
+    }
+    assert_eq!(source.bytes_read() - before, 13);
+    assert_eq!(session.usage().read, 13);
+    std::fs::remove_dir_all(dir)?;
     Ok(())
 }

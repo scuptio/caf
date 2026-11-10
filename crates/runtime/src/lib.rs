@@ -679,6 +679,16 @@ impl Artifact {
     /// requested bytes plus the number of bytes actually pulled from the
     /// backing store (for read budgeting).
     pub fn read_payload_range(&self, path: &str, pos: u64, len: u64) -> Result<(Vec<u8>, u64)> {
+        self.read_payload_range_metered(path, pos, len, None)
+    }
+
+    fn read_payload_range_metered(
+        &self,
+        path: &str,
+        pos: u64,
+        len: u64,
+        mut meter: Option<&mut Meter>,
+    ) -> Result<(Vec<u8>, u64)> {
         let map = self.payload_map()?;
         let &(offset, flen) = map
             .get(path)
@@ -693,7 +703,7 @@ impl Artifact {
         // Sealed artifact: `offset` is the file's start within the plaintext
         // blob; covering ciphertext chunks are hash-verified, then decrypted.
         if let Some(sealed) = &self.sealed {
-            return self.read_sealed_range(sealed, offset, pos, len);
+            return self.read_sealed_range(sealed, offset, pos, len, meter);
         }
 
         let node = payload::find(&self.manifest.payloads[0].root, path)
@@ -703,7 +713,7 @@ impl Artifact {
         if node.chunks.len() <= 1 {
             // Single-chunk (or empty) file: the root hash is the plain SHA-256
             // of the bytes. Fetch once, verify, slice out the window.
-            let data = self.fetch_verified(offset, flen, &node.hash, &mut fetched)?;
+            let data = self.fetch_verified(offset, flen, &node.hash, &mut fetched, meter)?;
             let start = usize::try_from(pos).context("offset out of range")?;
             let end = start
                 .checked_add(usize::try_from(len).context("length out of range")?)
@@ -721,7 +731,13 @@ impl Artifact {
                     .chunks
                     .get(usize::try_from(index).context("chunk index out of range")?)
                     .context("chunk hash missing")?;
-                let data = self.fetch_verified(offset + cs, ce - cs, expected, &mut fetched)?;
+                let data = self.fetch_verified(
+                    offset + cs,
+                    ce - cs,
+                    expected,
+                    &mut fetched,
+                    meter.as_deref_mut(),
+                )?;
                 let from =
                     usize::try_from(pos.saturating_sub(cs)).context("offset out of range")?;
                 let remaining = usize::try_from(len).context("length out of range")? - out.len();
@@ -743,6 +759,7 @@ impl Artifact {
         file_start: u64,
         pos: u64,
         len: u64,
+        mut meter: Option<&mut Meter>,
     ) -> Result<(Vec<u8>, u64)> {
         let abs_start = file_start + pos;
         let abs_end = abs_start + len;
@@ -753,7 +770,8 @@ impl Artifact {
         let mut fetched = 0u64;
         let mut index = first;
         while index <= last {
-            let chunk = self.fetch_chunk_sealed(sealed, index, &mut fetched)?;
+            let chunk =
+                self.fetch_chunk_sealed(sealed, index, &mut fetched, meter.as_deref_mut())?;
             let chunk_base = index * chunk_size;
             let from =
                 usize::try_from(abs_start.saturating_sub(chunk_base)).context("offset range")?;
@@ -772,6 +790,7 @@ impl Artifact {
         sealed: &SealedState,
         index: u64,
         fetched: &mut u64,
+        meter: Option<&mut Meter>,
     ) -> Result<Vec<u8>> {
         let chunk_size = manifest::CHUNK_SIZE as u64;
         let plain_len = chunk_size.min(sealed.padded_length - index * chunk_size);
@@ -786,6 +805,7 @@ impl Artifact {
                 return Ok(data);
             }
         }
+        charge_fetch(meter, ct_len)?;
         let ct = self.source.read_at(ct_off, ct_len)?;
         *fetched += ct_len;
         let expected = sealed
@@ -814,6 +834,7 @@ impl Artifact {
         len: u64,
         expected_hash: &str,
         fetched: &mut u64,
+        meter: Option<&mut Meter>,
     ) -> Result<Vec<u8>> {
         {
             let mut cache = self
@@ -824,6 +845,7 @@ impl Artifact {
                 return Ok(data);
             }
         }
+        charge_fetch(meter, len)?;
         let data = self.source.read_at(chunk_off, len)?;
         *fetched += len;
         if payload::chunk_hash(&data) != expected_hash {
@@ -891,6 +913,17 @@ impl Artifact {
         }
         Ok(data)
     }
+}
+
+// Reserve before attempting the physical read, including attempts that later
+// fail verification or I/O. Such work must never be free to retry.
+fn charge_fetch(meter: Option<&mut Meter>, len: u64) -> Result<()> {
+    if let Some(meter) = meter
+        && !meter.charge_read(len)
+    {
+        bail!("payload read exceeds the read budget");
+    }
+    Ok(())
 }
 
 fn decode_hash(hex_str: &str) -> Result<[u8; 32]> {
@@ -994,17 +1027,40 @@ fn is_reachable(path: &str, access: &[manifest::AccessScope]) -> bool {
     false
 }
 
-fn read_guest_mem(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
-    if ptr < 0 || len < 0 {
+/// Validate the complete range before allocating any host-side buffer.
+fn guest_range(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> Option<std::ops::Range<usize>> {
+    let start = usize::try_from(ptr).ok()?;
+    let len = usize::try_from(len).ok()?;
+    if len as u64 > caller.data().meter.budgets().memory_max {
         return None;
     }
+    let end = start.checked_add(len)?;
     let mem = match caller.get_export("memory") {
         Some(Extern::Memory(m)) => m,
         _ => return None,
     };
-    let mut buf = vec![0u8; len as usize];
-    mem.read(caller, ptr as usize, &mut buf).ok()?;
-    Some(buf)
+    (end <= mem.data_size(&*caller)).then_some(start..end)
+}
+
+fn read_guest_mem(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+    let range = guest_range(caller, ptr, len)?;
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(m)) => m,
+        _ => return None,
+    };
+    Some(mem.data(&*caller).get(range)?.to_vec())
+}
+
+fn read_guest_output(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+    guest_range(caller, ptr, len)?;
+    if !caller.data_mut().meter.charge_output(len as u64) {
+        return None;
+    }
+    read_guest_mem(caller, ptr, len)
 }
 
 fn read_guest_str(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
@@ -1048,42 +1104,45 @@ fn host_read(mut caller: Caller<'_, HostState>, fd: i32, buf_ptr: i32, buf_len: 
     if fd < 0 || buf_len <= 0 {
         return -1;
     }
-    // Fetch through the artifact's verifying reader; every byte pulled from the
-    // backing store is charged against the read budget. The borrow of the store
-    // data ends before we write back into guest memory.
-    let fetched = {
-        let state = caller.data_mut();
+    let (path, pos, n) = {
+        let state = caller.data();
         let Some(file) = state.fds.get(fd as usize).and_then(|slot| slot.as_ref()) else {
             return -1;
         };
-        let path = file.path.clone();
-        let pos = file.pos;
-        let Some(&(_offset, flen)) = state.fs.files.get(&path) else {
+        let Some(&(_, flen)) = state.fs.files.get(&file.path) else {
             return -1;
         };
-        let remaining = flen.saturating_sub(pos);
-        let n = remaining.min(buf_len as u64);
-        if n == 0 {
-            return 0;
-        }
-        match state.artifact.read_payload_range(&path, pos, n) {
-            Ok((data, fetched_bytes)) => {
-                if !state.meter.charge_read(fetched_bytes) {
-                    return -1; // read budget exhausted
-                }
-                if let Some(file) = state.fds[fd as usize].as_mut() {
-                    file.pos = pos + n;
-                }
-                data
-            }
+        (
+            file.path.clone(),
+            file.pos,
+            flen.saturating_sub(file.pos).min(buf_len as u64),
+        )
+    };
+    if n == 0 {
+        return 0;
+    }
+    if guest_range(&mut caller, buf_ptr, n as i32).is_none() {
+        return -1;
+    }
+    let data = {
+        let state = caller.data_mut();
+        // A cache miss reserves its budget before I/O and cache insertion.
+        // Denied reads cannot populate the cache and become free on retry.
+        match state
+            .artifact
+            .read_payload_range_metered(&path, pos, n, Some(&mut state.meter))
+        {
+            Ok((data, _)) => data,
             Err(_) => return -1,
         }
     };
-    if write_guest(&mut caller, buf_ptr, &fetched) {
-        fetched.len() as i32
-    } else {
-        -1
+    if !write_guest(&mut caller, buf_ptr, &data) {
+        return -1;
     }
+    if let Some(file) = caller.data_mut().fds[fd as usize].as_mut() {
+        file.pos = pos + n;
+    }
+    data.len() as i32
 }
 
 fn host_readdir(
@@ -1181,26 +1240,19 @@ fn host_self_size(caller: Caller<'_, HostState>) -> i64 {
 
 /// `emit(ptr, len) -> i32`: structured output, charged against `output_max`.
 fn host_emit(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
-    let Some(bytes) = read_guest_mem(&mut caller, ptr, len) else {
+    let Some(bytes) = read_guest_output(&mut caller, ptr, len) else {
         return -1;
     };
     let state = caller.data_mut();
-    if !state.meter.charge_output(bytes.len() as u64) {
-        return -1; // output budget exhausted
-    }
     state.emitted.extend_from_slice(&bytes);
     0
 }
 
 /// `log(ptr, len) -> i32`: diagnostic output, also charged against `output_max`.
 fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) -> i32 {
-    let Some(bytes) = read_guest_mem(&mut caller, ptr, len) else {
+    let Some(bytes) = read_guest_output(&mut caller, ptr, len) else {
         return -1;
     };
-    let state = caller.data_mut();
-    if !state.meter.charge_output(bytes.len() as u64) {
-        return -1;
-    }
     eprintln!("[caf log] {}", String::from_utf8_lossy(&bytes));
     0
 }
@@ -1283,19 +1335,23 @@ impl Session {
 
     /// Read `len` bytes from the component's linear memory at `ptr`.
     pub fn read_memory(&mut self, ptr: u32, len: u32) -> Result<Vec<u8>> {
-        // Bytes pulled out of guest memory are output too (the packed-result
-        // channel): charge them before copying anything out.
-        if !self.store.data_mut().meter.charge_output(len as u64) {
-            return Err(anyhow::anyhow!("read_memory exceeds the output budget"));
-        }
         let mem = self
             .instance
             .get_memory(&mut self.store, "memory")
             .context("component has no exported memory")?;
-        let mut buf = vec![0u8; len as usize];
-        mem.read(&self.store, ptr as usize, &mut buf)
-            .context("read component memory")?;
-        Ok(buf)
+        let start = ptr as usize;
+        let end = start
+            .checked_add(len as usize)
+            .context("guest memory range overflow")?;
+        if len as u64 > self.store.data().meter.budgets().memory_max
+            || end > mem.data_size(&self.store)
+        {
+            bail!("read component memory: range out of bounds");
+        }
+        if !self.store.data_mut().meter.charge_output(len as u64) {
+            bail!("read_memory exceeds the output budget");
+        }
+        Ok(mem.data(&self.store)[start..end].to_vec())
     }
 
     /// Bytes emitted via `caf.emit` so far.

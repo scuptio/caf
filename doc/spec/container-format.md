@@ -472,10 +472,22 @@ content key (32 B, random per build — or convergent, see below)
 - **Convergent builds**: `caf-tool build` normally draws a fresh random
   content key, so two builds of identical input differ. Setting
   `[encrypt] key_seed` derives the content key from the seed plus the
-  plaintext identity (interface, component, and payload-tree hashes) and the
-  keybox ephemerals deterministically, making builds byte-reproducible.
-  Rotate the seed only with intent: convergence is what makes rebuilds
-  comparable.
+  complete plaintext identity, making builds byte-reproducible. The identity
+  is SHA-256 of the CBOR tuple `(interface_hash, private_manifest_before_encryption)`.
+  This private manifest includes all private metadata, component plaintext
+  hashes/exports/scopes, and the full payload tree and lengths; its payload
+  `hash` is temporarily SHA-256 of the padded plaintext blob and `chunks` is
+  empty. After key derivation these two fields are replaced by ciphertext refs.
+  Thus changing private metadata also rotates the content key, avoiding reuse
+  of the private section's key and nonce with different plaintext.
+  Each recipient's ephemeral scalar is derived using
+  `KDF("keybox-eph", seed || content_key || recipient_sec1 || counter)`
+  (first valid scalar for counter 0..255). Including the content key prevents
+  reuse of a wrapping key and nonce across different content keys.
+  This fixes the former draft derivation: reproducible build bytes and keys
+  change, while existing sealed artifacts remain readable. Existing artifacts
+  made with the former derivation should be rebuilt using a fresh seed; the
+  fix does not retroactively protect their ciphertext.
 
 ### 8.1 Fetch modes and access patterns
 
@@ -537,7 +549,10 @@ the manifest's chunk hashes *before* handing bytes to the guest. Every byte a
 component receives is therefore verified before use; bytes that are never read
 are never fetched or verified. Hosts may cache verified chunk bytes; the
 `read_max` budget counts bytes actually pulled from the backing store, cache
-hits excluded.
+hits excluded. Native hosts reserve each cache miss against `read_max` before
+I/O or cache insertion. Denied misses never populate the cache; attempted
+reads that fail I/O or verification retain their reservation, so repeated
+failures cannot perform uncharged work.
 
 The security invariant is unchanged versus whole-file verification: tampering
 is detected before the affected bytes are used, and undetected tampering is

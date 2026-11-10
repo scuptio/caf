@@ -71,3 +71,90 @@ fn component_kind(kind: ComponentExternalKind) -> &'static str {
         Component => "component",
     }
 }
+
+/// Validated v1 core exports, retaining the real export name for invocation.
+pub struct CoreExports {
+    pub functions: std::collections::HashMap<String, (String, wasmparser::FuncType)>,
+    pub memory32: bool,
+}
+
+pub fn core_exports(wasm: &[u8]) -> anyhow::Result<CoreExports> {
+    use anyhow::{Context, bail};
+    use wasmparser::{Encoding, TypeRef, Validator};
+    Validator::new()
+        .validate_all(wasm)
+        .context("validate WASM module")?;
+    let mut types = Vec::new();
+    let mut functions = Vec::new();
+    let mut memories = Vec::new();
+    let mut exports = Vec::new();
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload? {
+            Payload::Version {
+                encoding: Encoding::Component,
+                ..
+            } => {
+                bail!("format v1 requires a core WASM module");
+            }
+            Payload::TypeSection(reader) => {
+                for ty in reader.into_iter_err_on_gc_types() {
+                    types.push(ty?);
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    match import?.ty {
+                        TypeRef::Func(index) | TypeRef::FuncExact(index) => functions.push(index),
+                        TypeRef::Memory(memory) => memories.push(memory),
+                        _ => {}
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for index in reader {
+                    functions.push(index?);
+                }
+            }
+            Payload::MemorySection(reader) => {
+                for memory in reader {
+                    memories.push(memory?);
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    exports.push(export?);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = CoreExports {
+        functions: Default::default(),
+        memory32: false,
+    };
+    for export in exports {
+        if export.kind == ExternalKind::Func {
+            let ty_index = *functions
+                .get(export.index as usize)
+                .context("function index missing")?;
+            let ty = types
+                .get(ty_index as usize)
+                .context("function type missing")?
+                .clone();
+            let name = export.name.replace('_', "-");
+            if out
+                .functions
+                .insert(name.clone(), (export.name.to_string(), ty))
+                .is_some()
+            {
+                bail!("ambiguous WASM export name '{name}' after caf-abi name normalization");
+            }
+        } else if export.kind == ExternalKind::Memory && export.name == "memory" {
+            let memory = memories
+                .get(export.index as usize)
+                .context("memory index missing")?;
+            out.memory32 = !memory.memory64 && !memory.shared;
+        }
+    }
+    Ok(out)
+}

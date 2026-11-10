@@ -11,14 +11,22 @@ component authors can rely on.
 ## 1. Execution model
 
 Format v1 executes **core WASM modules** against the `caf.*` host ABI. WIT is
-the *declared* contract (checked at build time, bound to exports), but calls
-are made against raw WASM exports. True Component Model instantiation is the
+the *declared* contract, and calls are made against raw WASM exports. At build
+time every function of a declared capability must have a real function export
+with exactly the caf-abi parameter and result types. Missing exports, wrong
+kinds/types, malformed modules, or invalid memory bridges are hard errors.
+Kebab-case WIT names may bind to snake_case WASM names; ambiguous normalized
+names are rejected and the manifest records the actual WASM export name.
+World exports not bound to a component capability are not advertised. Each
+artifact-level capability must have an implementing component. True Component Model instantiation is the
 v2 upgrade path (see §6).
 
 ## 2. Scalars
 
 - WIT scalar types map directly: `u32/s32` → `i32`, `u64/s64` → `i64`,
   `f32`/`f64` → `f32`/`f64`, `bool` → `i32` (0/1), `char` → `i32` (scalar value).
+- Enums and flags with at most 32 flags lower to `i32`; larger flag sets use
+  the complex-value encoding. Type aliases lower like their target.
 - A function whose WIT signature uses only scalars needs no memory bridge.
 
 ## 3. Complex values
@@ -54,11 +62,13 @@ result = ptr | (len << 32)
 - The guest allocates the buffer and **leaks it to the host**; the host reads
   `len` bytes at `ptr`, then calls the component's exported
   `dealloc(ptr: u32, len: u32)` to release it.
-- A component that exports functions returning complex values **must** export
-  `alloc` and `dealloc`.
+- A component with bound functions accepting or returning complex values
+  **must** export `alloc: (i32) -> i32`, `dealloc: (i32, i32) -> ()`, and an
+  unshared 32-bit linear memory named `memory`. Export names alone do not
+  satisfy the bridge: the builder verifies their kinds and signatures.
 - `len == 0` with `ptr == 0` encodes the empty value.
-- An `i32` result may use the same packing when 32-bit offsets suffice; hosts
-  detect the convention from the WIT result type, not from the WASM type.
+- Complex results always use `i64`; an `i32` result is a scalar, not a packed
+  pointer/length pair.
 
 ### 3.3 The emit channel
 

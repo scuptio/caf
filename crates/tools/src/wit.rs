@@ -25,6 +25,7 @@ pub struct FunctionExport {
     /// Whether the signature needs the caf-abi memory bridge (complex
     /// params/results — anything beyond scalars).
     pub needs_bridge: bool,
+    pub core_type: wasmparser::FuncType,
 }
 
 /// Parse one or more WIT source files into a single `Resolve`.
@@ -63,6 +64,7 @@ pub fn exports(wit: &Wit, world: WorldId) -> Vec<WorldExport> {
                         name: n.clone(),
                         signature: func_signature(f),
                         needs_bridge: func_needs_memory_bridge(&wit.resolve, f),
+                        core_type: core_signature(&wit.resolve, f),
                     })
                     .collect();
                 out.push(WorldExport { name, functions });
@@ -74,6 +76,7 @@ pub fn exports(wit: &Wit, world: WorldId) -> Vec<WorldExport> {
                         name: f.name.clone(),
                         signature: func_signature(f),
                         needs_bridge: func_needs_memory_bridge(&wit.resolve, f),
+                        core_type: core_signature(&wit.resolve, f),
                     }],
                 });
             }
@@ -124,10 +127,11 @@ fn func_signature(f: &Function) -> String {
 fn type_needs_bridge(resolve: &Resolve, ty: &wit_parser::Type) -> bool {
     use wit_parser::{Type, TypeDefKind};
     match ty {
-        Type::String => true,
+        Type::String | Type::ErrorContext => true,
         Type::Id(id) => match &resolve.types[*id].kind {
             TypeDefKind::Type(inner) => type_needs_bridge(resolve, inner),
-            TypeDefKind::Flags(_) | TypeDefKind::Enum(_) => false,
+            TypeDefKind::Flags(flags) => flags.flags.len() > 32,
+            TypeDefKind::Enum(_) => false,
             _ => true,
         },
         _ => false,
@@ -138,4 +142,45 @@ fn type_needs_bridge(resolve: &Resolve, ty: &wit_parser::Type) -> bool {
 pub fn func_needs_memory_bridge(resolve: &Resolve, f: &Function) -> bool {
     f.params.iter().any(|p| type_needs_bridge(resolve, &p.ty))
         || f.result.is_some_and(|t| type_needs_bridge(resolve, &t))
+}
+
+/// caf-abi v1 passes complex parameters as (i32, i32) and complex
+/// results as one packed i64. Type aliases lower exactly like their target.
+fn core_scalar(resolve: &Resolve, ty: &wit_parser::Type) -> wasmparser::ValType {
+    use wasmparser::ValType;
+    use wit_parser::{Type, TypeDefKind};
+    match ty {
+        Type::U64 | Type::S64 => ValType::I64,
+        Type::F32 => ValType::F32,
+        Type::F64 => ValType::F64,
+        Type::Id(id) => match &resolve.types[*id].kind {
+            TypeDefKind::Type(inner) => core_scalar(resolve, inner),
+            _ => ValType::I32,
+        },
+        _ => ValType::I32,
+    }
+}
+
+fn core_signature(resolve: &Resolve, f: &Function) -> wasmparser::FuncType {
+    use wasmparser::ValType;
+    let mut params = Vec::new();
+    for param in &f.params {
+        if type_needs_bridge(resolve, &param.ty) {
+            params.extend([ValType::I32, ValType::I32]);
+        } else {
+            params.push(core_scalar(resolve, &param.ty));
+        }
+    }
+    let results: Vec<_> = f
+        .result
+        .map(|ty| {
+            if type_needs_bridge(resolve, &ty) {
+                ValType::I64
+            } else {
+                core_scalar(resolve, &ty)
+            }
+        })
+        .into_iter()
+        .collect();
+    wasmparser::FuncType::new(params, results)
 }
