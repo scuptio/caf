@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::{assemble, config, wizard};
-use caf_core::{hex, layout, manifest, payload, verify};
+use caf_core::{crypto, hex, layout, manifest, payload, verify};
 
 fn temp_root(name: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("caf-tool-test-{}-{}", std::process::id(), name));
@@ -1411,5 +1411,210 @@ fn partial_and_corrupt_reads_cannot_retry_without_charging_their_io() -> Result<
     assert_eq!(source.bytes_read() - before, 13);
     assert_eq!(session.usage().read, 13);
     std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+fn zip_bytes(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    archive.by_name(name)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[test]
+fn export_zip_preserves_contents_and_is_deterministic() -> Result<()> {
+    let dir = temp_root("export-plain")?;
+    write_signed_config(&dir, &["/data"])?;
+    std::fs::create_dir_all(dir.join("payload/empty-dir"))?;
+    std::fs::write(dir.join("payload/empty"), [])?;
+    let large = vec![0x5a; 2 * 1024 * 1024 + 17];
+    std::fs::write(dir.join("payload/large.bin"), &large)?;
+    let bytes = build_bytes(&dir)?;
+    let input = dir.join("input.caf");
+    let output = dir.join("output.zip");
+    std::fs::write(&input, &bytes)?;
+    crate::export::export(&input, &output, false, None, None)?;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&output)?)?;
+    let header = layout::read_header(&bytes)?;
+    assert_eq!(
+        zip_bytes(&mut zip, "manifest.cbor")?,
+        layout::slice(&bytes, header.manifest_offset, header.manifest_len)?
+    );
+    assert_eq!(
+        zip_bytes(&mut zip, "interfaces/interface.wit")?,
+        std::fs::read(dir.join("spatial.wit"))?
+    );
+    assert_eq!(
+        zip_bytes(&mut zip, "components/0000.wasm")?,
+        std::fs::read(dir.join("spatial.wasm"))?
+    );
+    assert_eq!(
+        zip_bytes(&mut zip, "payload/data/city.parquet")?,
+        b"parquet-bytes"
+    );
+    assert_eq!(zip_bytes(&mut zip, "payload/large.bin")?, large);
+    assert!(zip_bytes(&mut zip, "payload/empty")?.is_empty());
+    assert!(zip.by_name("payload/empty-dir/")?.is_dir());
+    assert_eq!(zip_bytes(&mut zip, "signature.bin")?.len(), 96);
+    let metadata: serde_json::Value = serde_json::from_slice(&zip_bytes(&mut zip, "export.json")?)?;
+    assert_eq!(metadata["components"][0]["name"], "spatial");
+    assert_eq!(metadata["root_hash"], hex::encode(&header.root_hash));
+    let second = dir.join("second.zip");
+    crate::export::export(&input, &second, false, None, None)?;
+    assert_eq!(std::fs::read(&output)?, std::fs::read(&second)?);
+    assert!(crate::export::export(&input, &output, false, None, None).is_err());
+    crate::export::export(&input, &output, true, None, None)?;
+    assert!(crate::export::export(&input, &input, true, None, None).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn export_sealed_zip_requires_key_and_exports_plaintext() -> Result<()> {
+    let dir = temp_root("export-sealed")?;
+    let (secret, public) = recipient_keypair();
+    write_sealed_config(&dir, &["/data"], &public, None, Some(&"11".repeat(32)))?;
+    let large = vec![0xab; 2 * 1024 * 1024 + 31];
+    std::fs::write(dir.join("payload/large"), &large)?;
+    let bytes = build_bytes(&dir)?;
+    let key = crypto::unwrap_artifact(&bytes, &secret)?.context("no content key")?;
+    let input = dir.join("input.caf");
+    let output = dir.join("output.zip");
+    std::fs::write(&input, &bytes)?;
+    assert!(crate::export::export(&input, &output, false, None, None).is_err());
+    assert!(crate::export::export(&input, &output, false, Some(&"00".repeat(32)), None).is_err());
+    assert!(!output.exists());
+    crate::export::export(
+        &input,
+        &output,
+        false,
+        None,
+        Some(&hex::encode(&secret.to_bytes())),
+    )?;
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&output)?)?;
+    assert_eq!(
+        zip_bytes(&mut zip, "components/0000.wasm")?,
+        b"\0asm\x01\0\0\0"
+    );
+    assert_eq!(zip_bytes(&mut zip, "payload/large")?, large);
+    let private = verify::open_private_manifest(&bytes, &key)?;
+    let exported: manifest::PrivateManifest =
+        ciborium::de::from_reader(zip_bytes(&mut zip, "private-manifest.cbor")?.as_slice())?;
+    assert_eq!(private.name, exported.name);
+    let second = dir.join("second.zip");
+    crate::export::export(&input, &second, false, Some(&hex::encode(&key)), None)?;
+    assert_eq!(std::fs::read(&output)?, std::fs::read(&second)?);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn export_failure_preserves_existing_output_and_cleans_temporary_file() -> Result<()> {
+    let dir = temp_root("export-failure")?;
+    write_config(&dir, &["/data"])?;
+    let mut bytes = build_bytes(&dir)?;
+    let header = layout::read_header(&bytes)?;
+    let entries = layout::decode_directory(layout::slice(
+        &bytes,
+        header.directory_offset,
+        header.directory_len,
+    )?)?;
+    let file = entries
+        .iter()
+        .find(|e| e.tag == layout::TAG_PAYLOAD)
+        .context("missing payload")?;
+    bytes[file.offset as usize] ^= 1;
+    let input = dir.join("input.caf");
+    let output = dir.join("output.zip");
+    std::fs::write(&input, bytes)?;
+    std::fs::write(&output, b"original output")?;
+    let count = std::fs::read_dir(&dir)?.count();
+    assert!(crate::export::export(&input, &output, true, None, None).is_err());
+    assert_eq!(std::fs::read(&output)?, b"original output");
+    assert_eq!(std::fs::read_dir(&dir)?.count(), count);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn export_does_not_require_execution_admission() -> Result<()> {
+    let dir = temp_root("export-no-admission")?;
+    write_config_full(
+        &dir,
+        &["/data"],
+        b"\0asm\x01\0\0\0",
+        "\n[policy]\nnetwork = true\n",
+    )?;
+    let bytes = build_bytes(&dir)?;
+    verify::verify_bytes(&bytes)?;
+    assert!(caf_runtime::Artifact::open(bytes.clone()).is_err());
+    let input = dir.join("input.caf");
+    std::fs::write(&input, bytes)?;
+    crate::export::export(&input, &dir.join("output.zip"), false, None, None)?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn export_rejects_conflicting_or_unsafe_payload_paths() -> Result<()> {
+    for (index, names) in [["case", "CASE"], ["bad:name", "other"]].iter().enumerate() {
+        let dir = temp_root(&format!("export-unsafe-{index}"))?;
+        write_config(&dir, &["/data"])?;
+        for name in names {
+            std::fs::write(dir.join("payload").join(name), b"content")?;
+        }
+        let input = dir.join("input.caf");
+        let output = dir.join("output.zip");
+        std::fs::write(&input, build_bytes(&dir)?)?;
+        assert!(crate::export::export(&input, &output, false, None, None).is_err());
+        assert!(!output.exists());
+        std::fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn export_rejects_invalid_signature_and_corrupted_sealed_padding() -> Result<()> {
+    for sealed in [false, true] {
+        let dir = temp_root(if sealed {
+            "export-bad-padding"
+        } else {
+            "export-bad-signature"
+        })?;
+        let (secret, public) = recipient_keypair();
+        if sealed {
+            write_sealed_config(&dir, &["/data"], &public, None, None)?;
+        } else {
+            write_signed_config(&dir, &["/data"])?;
+        }
+        let mut bytes = build_bytes(&dir)?;
+        let key = if sealed {
+            crypto::unwrap_artifact(&bytes, &secret)?.map(|key| hex::encode(&key))
+        } else {
+            None
+        };
+        let header = layout::read_header(&bytes)?;
+        let entries = layout::decode_directory(layout::slice(
+            &bytes,
+            header.directory_offset,
+            header.directory_len,
+        )?)?;
+        let tag = if sealed {
+            layout::TAG_PAYLOAD
+        } else {
+            layout::TAG_SIGNATURE
+        };
+        let entry = entries
+            .iter()
+            .find(|e| e.tag == tag)
+            .context("missing section")?;
+        bytes[(entry.offset + entry.length - 1) as usize] ^= 1;
+        let input = dir.join("input.caf");
+        let output = dir.join("output.zip");
+        std::fs::write(&input, bytes)?;
+        assert!(crate::export::export(&input, &output, false, key.as_deref(), None).is_err());
+        assert!(!output.exists());
+        std::fs::remove_dir_all(dir)?;
+    }
     Ok(())
 }

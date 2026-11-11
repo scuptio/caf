@@ -28,3 +28,5 @@ wit-parser = { version = "0.262", features = ["decoding"] }
 wit-component = "0.262"
 wasm-metadata = "0.262"
 askama = "0.16.1"
+zip = { version = "2.2.2", default-features = false, features = ["deflate"] }
+tempfile = "3"

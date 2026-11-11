@@ -8,6 +8,7 @@
 # Common entry points:
 #   cargo make            # = cargo make build
 #   cargo make build      # release build of the whole workspace (compile only)
+#   cargo make install    # install the release caf-tool binary
 #   cargo make check      # fmt + clippy + test compilation (split into check-* steps)
 #   cargo make test       # cargo test --workspace
 #   cargo make doctor     # probe the dev toolchain; `-- install` adds the missing ones
@@ -47,6 +48,14 @@ description = "Debug-build the whole workspace"
 category = "Build"
 command = "cargo"
 args = ["build", "--workspace"]
+cwd = "${REPO_ROOT}"
+
+[tasks.install]
+clear = true
+description = "Install the release caf-tool binary (accepts cargo install arguments)"
+category = "Build"
+command = "cargo"
+args = ["install", "--path", "crates/tools", "--profile", "release", "--locked", "${@}"]
 cwd = "${REPO_ROOT}"
 
 [tasks.default]

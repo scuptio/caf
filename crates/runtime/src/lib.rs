@@ -179,6 +179,45 @@ impl ChunkCache {
     }
 }
 
+/// Read-only access to CAF contents, without execution admission checks.
+/// Integrity, signatures and decryption are checked exactly as at runtime
+/// open; payload contents are verified lazily as they are read. This wrapper
+/// deliberately does not expose an `Artifact` that could be instantiated.
+pub struct ArtifactContents(Artifact);
+
+impl ArtifactContents {
+    /// Open a backing store for inspection/export. Sealed artifacts require a key.
+    pub fn open(source: Arc<dyn PayloadSource>, key: Option<&[u8; 32]>) -> Result<Self> {
+        Ok(Self(Artifact::open_source_keyed(source, key, false)?))
+    }
+
+    /// Manifest view. For sealed artifacts, component hashes and lengths
+    /// describe ciphertext; names and payload metadata have been decrypted.
+    pub fn manifest(&self) -> &manifest::Manifest {
+        &self.0.manifest
+    }
+
+    /// Original CAF content identity, as a hex string.
+    pub fn root_hash(&self) -> String {
+        self.0.root_hash()
+    }
+
+    /// Payload file paths, Merkle hashes and byte lengths, in stored order.
+    pub fn payload_entries(&self) -> Vec<(String, String, u64)> {
+        self.0.payload_entries()
+    }
+
+    /// Read a verified plaintext payload range; see `Artifact::read_payload_range`.
+    pub fn read_payload_range(&self, path: &str, pos: u64, len: u64) -> Result<(Vec<u8>, u64)> {
+        self.0.read_payload_range(path, pos, len)
+    }
+
+    /// Read a verified component, decrypting it when necessary.
+    pub fn wasm_bytes(&self, index: usize) -> Result<Vec<u8>> {
+        self.0.wasm_bytes(index)
+    }
+}
+
 impl Artifact {
     /// Parse and **fully** verify an in-memory artifact (hash chain over every
     /// section, access scopes, signature), then open it. Use this for strict
@@ -193,7 +232,7 @@ impl Artifact {
     pub fn open_with_key(bytes: Vec<u8>, content_key: &[u8; 32]) -> Result<Self> {
         caf_core::verify::verify_bytes_keyed(&bytes, Some(content_key))
             .context("verify artifact")?;
-        Self::open_source_keyed(Arc::new(SliceSource::new(bytes)), Some(content_key))
+        Self::open_source_keyed(Arc::new(SliceSource::new(bytes)), Some(content_key), true)
     }
 
     /// Open an artifact over a backing store, reading only the boot area
@@ -202,7 +241,7 @@ impl Artifact {
     /// **not** read here: they are fetched and Merkle-verified per chunk on
     /// first use, so opening a large artifact costs a few KB of reads.
     pub fn open_source(source: Arc<dyn PayloadSource>) -> Result<Self> {
-        Self::open_source_keyed(source, None)
+        Self::open_source_keyed(source, None, true)
     }
 
     /// [`Artifact::open_source`] for a sealed artifact. Payload chunks are
@@ -212,14 +251,18 @@ impl Artifact {
         source: Arc<dyn PayloadSource>,
         content_key: &[u8; 32],
     ) -> Result<Self> {
-        Self::open_source_keyed(source, Some(content_key))
+        Self::open_source_keyed(source, Some(content_key), true)
     }
 
-    fn open_source_keyed(source: Arc<dyn PayloadSource>, key: Option<&[u8; 32]>) -> Result<Self> {
+    fn open_source_keyed(
+        source: Arc<dyn PayloadSource>,
+        key: Option<&[u8; 32]>,
+        admit: bool,
+    ) -> Result<Self> {
         let head = source.read_at(0, layout::HEADER_SIZE)?;
         let header = layout::read_header(&head)?;
         if header.flags & layout::FLAG_ENCRYPTED != 0 {
-            return Self::open_sealed(source, header, key);
+            return Self::open_sealed(source, header, key, admit);
         }
 
         let manifest_bytes = source.read_at(header.manifest_offset, header.manifest_len)?;
@@ -306,8 +349,10 @@ impl Artifact {
                 bail!("component '{}' hash mismatch", comp.name);
             }
             wasm_hashes.push(h);
-            component_imports
-                .push(enumerate_imports(&data).context("admission: enumerate imports")?);
+            if admit {
+                component_imports
+                    .push(enumerate_imports(&data).context("admission: enumerate imports")?);
+            }
         }
 
         // Root identity binds everything above together.
@@ -341,19 +386,21 @@ impl Artifact {
             }
         }
 
-        // Admission, part 1: a declared-but-unsupported capability is a hard
-        // error at open time, not a silent no-op at run time. The execution
-        // profile likewise must name a machine-checkable configuration.
-        caf_security::check_policy_supported(&manifest.policy)
-            .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
-        caf_security::check_execution_profile(&manifest.execution)
-            .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
-        // Admission, part 2: every component import must resolve against the
-        // declared policy before anyone can instantiate it (fail-closed).
-        for (comp, imports) in manifest.components.iter().zip(&component_imports) {
-            caf_security::resolve_imports(&manifest.policy, imports).map_err(|e| {
-                anyhow::anyhow!("admission rejected for component '{}': {e}", comp.name)
-            })?;
+        if admit {
+            // Admission, part 1: a declared-but-unsupported capability is a hard
+            // error at open time, not a silent no-op at run time. The execution
+            // profile likewise must name a machine-checkable configuration.
+            caf_security::check_policy_supported(&manifest.policy)
+                .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
+            caf_security::check_execution_profile(&manifest.execution)
+                .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
+            // Admission, part 2: every component import must resolve against the
+            // declared policy before anyone can instantiate it (fail-closed).
+            for (comp, imports) in manifest.components.iter().zip(&component_imports) {
+                caf_security::resolve_imports(&manifest.policy, imports).map_err(|e| {
+                    anyhow::anyhow!("admission rejected for component '{}': {e}", comp.name)
+                })?;
+            }
         }
 
         Ok(Self {
@@ -375,6 +422,7 @@ impl Artifact {
         source: Arc<dyn PayloadSource>,
         header: layout::Header,
         key: Option<&[u8; 32]>,
+        admit: bool,
     ) -> Result<Self> {
         let content_key = *key.context(
             "artifact is sealed (FLAG_ENCRYPTED); supply the content key via \
@@ -471,8 +519,10 @@ impl Artifact {
                 );
             }
             component_ct_hashes.push(h);
-            component_imports
-                .push(enumerate_imports(&plain).context("admission: enumerate imports")?);
+            if admit {
+                component_imports
+                    .push(enumerate_imports(&plain).context("admission: enumerate imports")?);
+            }
         }
 
         // Payload blob: one ciphertext section; lazy per-chunk verify+decrypt
@@ -593,15 +643,17 @@ impl Artifact {
             bail!("payload real length mismatch");
         }
 
-        // Admission: identical policy gates to the plaintext path.
-        caf_security::check_policy_supported(&manifest.policy)
-            .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
-        caf_security::check_execution_profile(&manifest.execution)
-            .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
-        for (comp, imports) in private.components.iter().zip(&component_imports) {
-            caf_security::resolve_imports(&manifest.policy, imports).map_err(|e| {
-                anyhow::anyhow!("admission rejected for component '{}': {e}", comp.name)
-            })?;
+        if admit {
+            // Admission: identical policy gates to the plaintext path.
+            caf_security::check_policy_supported(&manifest.policy)
+                .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
+            caf_security::check_execution_profile(&manifest.execution)
+                .map_err(|e| anyhow::anyhow!("admission rejected: {e}"))?;
+            for (comp, imports) in private.components.iter().zip(&component_imports) {
+                caf_security::resolve_imports(&manifest.policy, imports).map_err(|e| {
+                    anyhow::anyhow!("admission rejected for component '{}': {e}", comp.name)
+                })?;
+            }
         }
 
         let sealed = SealedState {
@@ -885,6 +937,7 @@ impl Artifact {
         Ok(map)
     }
 
+    /// Read and verify a component, decrypting it when the artifact is sealed.
     fn wasm_bytes(&self, index: usize) -> Result<Vec<u8>> {
         let entries: Vec<_> = self
             .directory
