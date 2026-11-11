@@ -176,8 +176,15 @@ python3 -m http.server 8000
 无后端时也可用 Node 直接冒烟测试宿主运行时：
 
 ```bash
+cargo build -p caf-tool
+PATH="$PWD/target/debug:$PATH" bash examples/gis-demo/build.sh
 node examples/gis-demo/web/caf.test.mjs   # 覆盖 整文件回退 / Range / 内存 / 跨宿主一致性
 ```
+
+以上命令在仓库根目录执行，需要 Rust 的 `wasm32-unknown-unknown` target
+（`rustup target add wasm32-unknown-unknown`）。`build.sh` 会生成测试所需的
+`demo.caf`、`demo-sealed.caf` 和 `web/sealed-key.js`；这些构建步骤也由 CI 的
+`js-host` job 在运行 Node 测试前执行。
 
 > 不可信工件可用 Worker 模式运行（`CAF.openCafWorker(...)`）：组件跑在 Web
 > Worker 中，主线程看门狗超时即终止——这是对 CPU/内存失控的尽力兜底（JS 宿主

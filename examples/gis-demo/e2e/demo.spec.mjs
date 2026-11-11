@@ -1,7 +1,10 @@
 // Browser e2e for the CAF gis-demo: drives the real page in Chrome via
-// playwright-core (channel "chrome" — uses the system browser, no download).
+// playwright-core (channel "chrome" — requires system Chrome).
 //
-//   cd examples/gis-demo/e2e && npm install && node demo.spec.mjs
+//   cd examples/gis-demo/e2e
+//   npm install
+//   npx playwright-core install --with-deps chrome
+//   node demo.spec.mjs
 //
 // Covers: page load with demo.caf over HTTP, canvas actually rendering,
 // projection switch re-render, GeoJSON/WKB format equivalence, and the

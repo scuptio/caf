@@ -23,9 +23,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Build tooling and demo artifacts
+        run: |
+          cargo build -p caf-tool
+          PATH="$PWD/target/debug:$PATH" bash examples/gis-demo/build.sh
       - name: Browser host smoke test (Node)
         run: node examples/gis-demo/web/caf.test.mjs
 
@@ -52,6 +59,7 @@ jobs:
         run: |
           cd examples/gis-demo/e2e
           npm install --no-audit --no-fund
+          npx playwright-core install --with-deps chrome
           node demo.spec.mjs
 
   fuzz-build:

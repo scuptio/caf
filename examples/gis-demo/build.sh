@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # 1. Compile the computation to a WASM module (core wasm + caf host ABI).
-cargo build --release --target wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown --manifest-path "$ROOT/Cargo.toml"
 cp "$ROOT/target/wasm32-unknown-unknown/release/gis_demo.wasm" "$ROOT/gis-demo.wasm"
 
 # 2. Generate the second data format (WKB) from the source GeoJSON.
