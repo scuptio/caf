@@ -21,8 +21,10 @@ pub struct Config {
     /// WIT source files, concatenated in the listed order.
     #[serde(default)]
     pub interfaces: Vec<String>,
-    /// `[payload]`: the payload directory.
-    pub payload: PayloadConfig,
+    /// `[[payloads]]`: the payload trees; the first is the default payload,
+    /// mounted at `/` in the guest filesystem.
+    #[serde(default)]
+    pub payloads: Vec<PayloadConfig>,
     /// `[execution]`: the execution profile.
     #[serde(default)]
     pub execution: ExecutionConfig,
@@ -62,9 +64,12 @@ pub struct EncryptConfig {
     pub key_seed: Option<String>,
 }
 
-/// `[payload]`: the payload directory.
+/// `[[payloads]]`: one payload tree.
 #[derive(Deserialize)]
 pub struct PayloadConfig {
+    /// Payload name (unique within the artifact); the first payload is the
+    /// default, mounted at `/` in the guest filesystem.
+    pub name: String,
     /// Payload root directory (relative to the `build.toml`).
     pub root: String,
     /// Media type recorded for the payload (default `application/octet-stream`).

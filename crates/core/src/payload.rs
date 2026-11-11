@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 use crate::hex;
-use crate::manifest::{CHUNK_SIZE, EntryKind, PayloadLayout, PayloadNode};
+use crate::manifest::{CHUNK_SIZE, EntryKind, PayloadLayout, PayloadNode, PayloadRef};
 
 /// Build the payload directory tree from a filesystem root. Every file is
 /// content-hashed as a Merkle tree over fixed-size chunks; the tree root is the
@@ -158,6 +158,55 @@ pub fn find<'a>(root: &'a PayloadNode, path: &str) -> Option<&'a PayloadNode> {
         node = node.entries.iter().find(|e| e.name == part)?;
     }
     Some(node)
+}
+
+/// Validate the multi-payload mount rules: names are unique, safe path
+/// segments, and no named payload collides with a top-level entry of the
+/// default (first) payload, whose tree is mounted at `/`.
+pub fn validate_payloads(payloads: &[PayloadRef]) -> Result<()> {
+    let pairs: Vec<(&str, &PayloadNode)> = payloads
+        .iter()
+        .map(|p| (p.name.as_str(), &p.root))
+        .collect();
+    validate_mounts(&pairs)
+}
+
+/// [`validate_payloads`] over `(name, tree)` pairs.
+pub fn validate_mounts(pairs: &[(&str, &PayloadNode)]) -> Result<()> {
+    let mut names = std::collections::HashSet::with_capacity(pairs.len());
+    for (name, _) in pairs {
+        let name = *name;
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            bail!("invalid payload name '{name}'");
+        }
+        if !names.insert(name) {
+            bail!("duplicate payload name '{name}'");
+        }
+    }
+    if let Some((_, default_root)) = pairs.first() {
+        for entry in &default_root.entries {
+            if pairs[1..].iter().any(|(name, _)| *name == entry.name) {
+                bail!(
+                    "payload name '{}' collides with a top-level entry of the default payload",
+                    entry.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a payload by name; "" selects the default (first) payload.
+pub fn resolve_payload<'a>(payloads: &'a [PayloadRef], name: &str) -> Result<&'a PayloadRef> {
+    if name.is_empty() {
+        return payloads
+            .first()
+            .context("access scope on an artifact without payloads");
+    }
+    payloads
+        .iter()
+        .find(|p| p.name == name)
+        .with_context(|| format!("unknown payload '{name}'"))
 }
 
 /// Recompute every directory hash in the tree bottom-up. Structural

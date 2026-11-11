@@ -41,7 +41,7 @@ fn write_config_full(dir: &Path, access: &[&str], wasm: &[u8], extra: &str) -> R
         .collect::<Vec<_>>()
         .join(", ");
     let toml = format!(
-        "name = \"city\"\nversion = \"0.1.0\"\n\ninterfaces = [\"spatial.wit\"]\n\n[payload]\nroot = \"payload\"\nmedia_type = \"application/x-spatial\"\n\n[[components]]\nname = \"spatial\"\nworld = \"spatial-file\"\npath = \"spatial.wasm\"\ncapabilities = []\naccess = [{access}]\n{extra}"
+        "name = \"city\"\nversion = \"0.1.0\"\n\ninterfaces = [\"spatial.wit\"]\n\n[[payloads]]\nname = \"main\"\nroot = \"payload\"\nmedia_type = \"application/x-spatial\"\n\n[[components]]\nname = \"spatial\"\nworld = \"spatial-file\"\npath = \"spatial.wasm\"\ncapabilities = []\naccess = [{access}]\n{extra}"
     );
     std::fs::write(dir.join("build.toml"), toml)?;
     std::fs::write(
@@ -982,7 +982,7 @@ fn signed_report_carries_signer_fingerprint() -> Result<()> {
     let report = verify::verify_bytes(&bytes)?;
     assert!(report.signed);
     assert_eq!(report.signature_valid, Some(true));
-    let Some(fp) = &report.signer_fingerprint else {
+    let Some(fp) = &report.signer_fingerprints.first() else {
         return Err(anyhow::anyhow!("missing signer fingerprint"));
     };
 
@@ -992,7 +992,7 @@ fn signed_report_carries_signer_fingerprint() -> Result<()> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("bad seed length"))?;
     let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-    assert_eq!(fp, &payload::chunk_hash(&pubkey));
+    assert_eq!(fp.as_str(), payload::chunk_hash(&pubkey));
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
@@ -1005,7 +1005,7 @@ fn unsigned_report_has_no_signer_fingerprint() -> Result<()> {
     let bytes = build_bytes(&dir)?;
     let report = verify::verify_bytes(&bytes)?;
     assert!(!report.signed);
-    assert_eq!(report.signer_fingerprint, None);
+    assert!(report.signer_fingerprints.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -1053,7 +1053,7 @@ fn convergent_builds_rotate_keys_for_metadata_and_content_changes() -> Result<()
         match change {
             0 => cfg.version = "0.2.0".into(),
             1 => cfg.name = "renamed".into(),
-            2 => cfg.payload.media_type = "application/new-type".into(),
+            2 => cfg.payloads[0].media_type = "application/new-type".into(),
             3 => cfg.components[0].name = "renamed-component".into(),
             4 => cfg.components[0].access = vec!["/index".into()],
             _ => std::fs::write(dir.join("payload/data/city.parquet"), b"new payload")?,
@@ -1441,7 +1441,11 @@ fn export_zip_preserves_contents_and_is_deterministic() -> Result<()> {
         layout::slice(&bytes, header.manifest_offset, header.manifest_len)?
     );
     assert_eq!(
-        zip_bytes(&mut zip, "interfaces/interface.wit")?,
+        zip_bytes(&mut zip, "interfaces.cbor")?,
+        layout::slice(&bytes, header.interface_offset, header.interface_len)?
+    );
+    assert_eq!(
+        zip_bytes(&mut zip, "interfaces/spatial.wit")?,
         std::fs::read(dir.join("spatial.wit"))?
     );
     assert_eq!(
@@ -1449,15 +1453,17 @@ fn export_zip_preserves_contents_and_is_deterministic() -> Result<()> {
         std::fs::read(dir.join("spatial.wasm"))?
     );
     assert_eq!(
-        zip_bytes(&mut zip, "payload/data/city.parquet")?,
+        zip_bytes(&mut zip, "payloads/main/data/city.parquet")?,
         b"parquet-bytes"
     );
-    assert_eq!(zip_bytes(&mut zip, "payload/large.bin")?, large);
-    assert!(zip_bytes(&mut zip, "payload/empty")?.is_empty());
-    assert!(zip.by_name("payload/empty-dir/")?.is_dir());
-    assert_eq!(zip_bytes(&mut zip, "signature.bin")?.len(), 96);
+    assert_eq!(zip_bytes(&mut zip, "payloads/main/large.bin")?, large);
+    assert!(zip_bytes(&mut zip, "payloads/main/empty")?.is_empty());
+    assert!(zip.by_name("payloads/main/empty-dir/")?.is_dir());
+    let signatures: Vec<manifest::SignatureEntry> =
+        ciborium::de::from_reader(zip_bytes(&mut zip, "signatures.cbor")?.as_slice())?;
+    assert_eq!(signatures.len(), 1);
     let metadata: serde_json::Value = serde_json::from_slice(&zip_bytes(&mut zip, "export.json")?)?;
-    assert_eq!(metadata["export_version"], 2);
+    assert_eq!(metadata["export_version"], 3);
     assert_eq!(metadata["components"][0]["name"], "spatial");
     assert_eq!(metadata["root_hash"], hex::encode(&header.root_hash));
     let second = dir.join("second.zip");
@@ -1512,7 +1518,7 @@ fn export_sealed_zip_requires_key_and_exports_plaintext() -> Result<()> {
         zip_bytes(&mut zip, "components/0000.wasm")?,
         b"\0asm\x01\0\0\0"
     );
-    assert_eq!(zip_bytes(&mut zip, "payload/large")?, large);
+    assert_eq!(zip_bytes(&mut zip, "payloads/main/large")?, large);
     let private = verify::open_private_manifest(&bytes, &key)?;
     let exported: manifest::PrivateManifest =
         ciborium::de::from_reader(zip_bytes(&mut zip, "private-manifest.cbor")?.as_slice())?;
@@ -1773,7 +1779,9 @@ fn import_detects_tampering() -> Result<()> {
 
     // A flipped payload byte breaks the per-file Merkle check.
     let bad = dir.join("bad-payload.zip");
-    rewrite_zip(&good, &bad, "payload/data/city.parquet", |b| b[0] ^= 1)?;
+    rewrite_zip(&good, &bad, "payloads/main/data/city.parquet", |b| {
+        b[0] ^= 1
+    })?;
     let err = crate::import::import(&bad, &dir.join("out.caf"), false).unwrap_err();
     assert!(
         format!("{err:#}").contains("does not match the manifest"),
@@ -1808,7 +1816,7 @@ fn import_detects_tampering() -> Result<()> {
             out.start_file(&name, options)?;
             out.write_all(&bytes)?;
         }
-        out.start_file("payload/sneaky.txt", options)?;
+        out.start_file("payloads/main/sneaky.txt", options)?;
         out.write_all(b"sneaky")?;
         out.finish()?;
     }
@@ -2158,7 +2166,7 @@ fn wasm_add4() -> Vec<u8> {
 fn write_nowit_config(dir: &Path, wasm: &[u8]) -> Result<()> {
     std::fs::write(
         dir.join("build.toml"),
-        "name = \"raw\"\nversion = \"0.1.0\"\ninterfaces = []\n\n[payload]\nroot = \"payload\"\nmedia_type = \"application/x-raw\"\n\n[[components]]\nname = \"raw\"\nworld = \"\"\npath = \"raw.wasm\"\ncapabilities = []\naccess = []\n",
+        "name = \"raw\"\nversion = \"0.1.0\"\ninterfaces = []\n\n[[payloads]]\nname = \"main\"\nroot = \"payload\"\nmedia_type = \"application/x-raw\"\n\n[[components]]\nname = \"raw\"\nworld = \"\"\npath = \"raw.wasm\"\ncapabilities = []\naccess = []\n",
     )?;
     std::fs::write(dir.join("raw.wasm"), wasm)?;
     Ok(())
@@ -2497,5 +2505,161 @@ fn extract_exports_covers_component_model_binaries() -> Result<()> {
             .any(|e| e.export == "answer" && e.signature == "func"),
         "{exports:?}"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multi-payload artifacts and the signature list.
+// ---------------------------------------------------------------------------
+
+/// Add a second payload tree `extra` (root payload2) to the fixture project.
+fn add_extra_payload(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir.join("payload2/info"))?;
+    std::fs::write(dir.join("payload2/info/meta.json"), b"meta")?;
+    let text = std::fs::read_to_string(dir.join("build.toml"))?;
+    let text = text.replace(
+        "\n[[components]]",
+        "\n[[payloads]]\nname = \"extra\"\nroot = \"payload2\"\nmedia_type = \"application/x-extra\"\n\n[[components]]",
+    );
+    std::fs::write(dir.join("build.toml"), text)?;
+    Ok(())
+}
+
+#[test]
+fn multi_payload_mounts_and_roundtrips() -> Result<()> {
+    let dir = temp_root("multi-payload")?;
+    write_config_full(&dir, &["/data", "extra:/info"], &wasm_scalar_answer(), "")?;
+    add_extra_payload(&dir)?;
+    let bytes = build_bytes(&dir)?;
+    let report = verify::verify_bytes(&bytes)?;
+    assert_eq!(report.payload_files, 3);
+
+    // The default payload mounts at `/`; the named payload at `/extra/`.
+    let artifact = caf_runtime::Artifact::open(bytes.clone())?;
+    assert_eq!(
+        artifact.read_payload("/data/city.parquet")?,
+        b"parquet-bytes"
+    );
+    assert_eq!(artifact.read_payload("/extra/info/meta.json")?, b"meta");
+    let files: Vec<String> = artifact
+        .payload_files()
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    assert!(files.contains(&"/extra/info/meta.json".to_string()));
+
+    // The access scope names their payloads.
+    let manifest = decode_manifest(&bytes)?;
+    assert_eq!(manifest.components[0].access[0].payload, "main");
+    assert_eq!(manifest.components[0].access[1].payload, "extra");
+
+    // export → import round-trip is byte-identical with two payloads.
+    let caf = dir.join("a.caf");
+    std::fs::write(&caf, &bytes)?;
+    let zip_path = dir.join("a.zip");
+    crate::export::export(&caf, &zip_path, false, None, None, Compression::Deflate)?;
+    let rebuilt = dir.join("b.caf");
+    crate::import::import(&zip_path, &rebuilt, false)?;
+    assert_eq!(std::fs::read(&rebuilt)?, bytes);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn build_rejects_payload_mount_collisions_and_duplicate_names() -> Result<()> {
+    // The default payload has a top-level `data/` directory; a second payload
+    // named "data" would shadow it at `/data`.
+    let dir = temp_root("payload-collision")?;
+    write_config_full(&dir, &[], &wasm_scalar_answer(), "")?;
+    std::fs::create_dir_all(dir.join("payload2"))?;
+    let text = std::fs::read_to_string(dir.join("build.toml"))?;
+    std::fs::write(
+        dir.join("build.toml"),
+        text.replace(
+            "\n[[components]]",
+            "\n[[payloads]]\nname = \"data\"\nroot = \"payload2\"\n\n[[components]]",
+        ),
+    )?;
+    let err = build_bytes(&dir).err().context("collision must fail")?;
+    assert!(format!("{err:#}").contains("collides"), "{err:#}");
+
+    // Duplicate payload names are rejected too.
+    let dir = temp_root("payload-duplicate")?;
+    write_config_full(&dir, &[], &wasm_scalar_answer(), "")?;
+    std::fs::create_dir_all(dir.join("payload2"))?;
+    let text = std::fs::read_to_string(dir.join("build.toml"))?;
+    std::fs::write(
+        dir.join("build.toml"),
+        text.replace(
+            "\n[[components]]",
+            "\n[[payloads]]\nname = \"main\"\nroot = \"payload2\"\n\n[[components]]",
+        ),
+    )?;
+    let err = build_bytes(&dir).err().context("duplicate must fail")?;
+    assert!(format!("{err:#}").contains("duplicate"), "{err:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(temp_root("payload-collision")?);
+    Ok(())
+}
+
+#[test]
+fn multi_signature_list_verifies_and_fails_closed() -> Result<()> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let dir = temp_root("multi-sig")?;
+    write_signed_config(&dir, &["/data"])?; // signer seed "11" * 32
+    let bytes = build_bytes(&dir)?;
+    let caf = dir.join("a.caf");
+    let good = dir.join("good.zip");
+    std::fs::write(&caf, &bytes)?;
+    crate::export::export(&caf, &good, false, None, None, Compression::Deflate)?;
+    let root_hash = layout::read_header(&bytes)?.root_hash;
+
+    // Append a second signature (seed "22" * 32), optionally corrupted.
+    let append = |b: &mut Vec<u8>, corrupt: bool| -> Result<()> {
+        let mut entries: Vec<manifest::SignatureEntry> = ciborium::de::from_reader(b.as_slice())?;
+        let seed: [u8; 32] = hex::decode(&"22".repeat(32))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("seed length"))?;
+        let key = SigningKey::from_bytes(&seed);
+        let pubkey = key.verifying_key().to_bytes();
+        let mut sig = key.sign(&root_hash).to_bytes();
+        if corrupt {
+            sig[0] ^= 1;
+        }
+        entries.push(manifest::SignatureEntry {
+            alg: manifest::SignatureAlgorithm::Ed25519,
+            key_id: payload::signer_fingerprint(&pubkey),
+            pubkey: serde_bytes::ByteBuf::from(pubkey.to_vec()),
+            sig: serde_bytes::ByteBuf::from(sig.to_vec()),
+        });
+        *b = Vec::new();
+        ciborium::ser::into_writer(&entries, b)?;
+        Ok(())
+    };
+
+    // Two valid signatures: import (which re-verifies) and verify both pass.
+    let two = dir.join("two.zip");
+    rewrite_zip(&good, &two, "signatures.cbor", |b| {
+        append(b, false).unwrap()
+    })?;
+    let rebuilt = dir.join("two.caf");
+    crate::import::import(&two, &rebuilt, false)?;
+    let report = verify::verify_bytes(&std::fs::read(&rebuilt)?)?;
+    assert_eq!(report.signature_valid, Some(true));
+    assert_eq!(report.signer_fingerprints.len(), 2);
+
+    // One valid + one corrupted entry: the whole artifact fails.
+    let bad = dir.join("bad.zip");
+    rewrite_zip(&good, &bad, "signatures.cbor", |b| append(b, true).unwrap())?;
+    assert!(crate::import::import(&bad, &dir.join("bad.caf"), false).is_err());
+
+    // An empty signature list is not a signature.
+    let empty = dir.join("empty.zip");
+    rewrite_zip(&good, &empty, "signatures.cbor", |b| {
+        *b = Vec::new();
+        ciborium::ser::into_writer(&Vec::<manifest::SignatureEntry>::new(), b).unwrap();
+    })?;
+    assert!(crate::import::import(&empty, &dir.join("empty.caf"), false).is_err());
+    std::fs::remove_dir_all(dir)?;
     Ok(())
 }

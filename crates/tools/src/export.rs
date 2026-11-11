@@ -9,9 +9,12 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 const BLOCK: u64 = manifest::CHUNK_SIZE as u64;
 
 /// export.json schema version written by this build (`doc/spec/round-trip.md` §3).
-pub const EXPORT_FORMAT_CURRENT: u64 = 2;
+/// v3: multi-payload inventory (`payloads/<name>/`), indexed interfaces
+/// (`interfaces.cbor` + `interfaces/<name>`), signature list
+/// (`signatures.cbor`).
+pub const EXPORT_FORMAT_CURRENT: u64 = 3;
 /// Oldest export.json schema version `import` accepts.
-pub const EXPORT_FORMAT_MIN: u64 = 1;
+pub const EXPORT_FORMAT_MIN: u64 = 3;
 
 /// ZIP compression mode for `export`: `deflate` (default) or `stored`
 /// (uncompressed; removes the deflate implementation from the set of inputs
@@ -111,9 +114,14 @@ pub fn export(
         );
     }
     if !sealed {
+        let manifest = artifact.manifest();
+        let root_hashes: Vec<String> = manifest
+            .payloads
+            .iter()
+            .map(|p| p.root.hash.clone())
+            .collect();
         ensure!(
-            artifact.manifest().hashes.payload
-                == [artifact.manifest().payloads[0].root.hash.clone()],
+            manifest.hashes.payload == root_hashes,
             "payload root hash mismatch"
         );
         let files = artifact.payload_entries();
@@ -122,7 +130,7 @@ pub fn export(
             .filter(|e| e.tag == layout::TAG_PAYLOAD)
             .collect();
         ensure!(files.len() == stored.len(), "payload file count mismatch");
-        for ((_, hash, len), entry) in files.iter().zip(stored) {
+        for ((_, _, hash, len), entry) in files.iter().zip(stored) {
             ensure!(
                 *len == entry.length && hex::decode(hash)? == entry.hash,
                 "payload directory mismatch"
@@ -130,18 +138,16 @@ pub fn export(
         }
     }
 
-    // Validate the tree before constructing paths: a slash in a node name
+    // Validate the trees before constructing paths: a slash in a node name
     // must never be mistaken for a legitimate nested directory.
-    let mut paths = HashSet::new();
-    let mut nodes = Vec::new();
-    collect_nodes(
-        &artifact.manifest().payloads[0].root,
-        "",
-        true,
-        &mut paths,
-        &mut nodes,
-    )?;
-    nodes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut payload_nodes = Vec::with_capacity(artifact.manifest().payloads.len());
+    for payload_ref in &artifact.manifest().payloads {
+        let mut paths = HashSet::new();
+        let mut nodes = Vec::new();
+        collect_nodes(&payload_ref.root, "", true, &mut paths, &mut nodes)?;
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
+        payload_nodes.push((payload_ref.name.clone(), nodes));
+    }
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -180,12 +186,23 @@ pub fn export(
         serde_json::to_vec_pretty(artifact.manifest())?
     };
     add(&mut zip, "manifest.json", &json, compression)?;
-    add(
-        &mut zip,
-        "interfaces/interface.wit",
-        &source.read_at(header.interface_offset, header.interface_len)?,
-        compression,
-    )?;
+    // Interfaces: the raw CBOR section (authoritative for import) plus each
+    // WIT source under its original name (for reading).
+    let interface_bytes = source.read_at(header.interface_offset, header.interface_len)?;
+    if !interface_bytes.is_empty() {
+        add(&mut zip, "interfaces.cbor", &interface_bytes, compression)?;
+        let files: Vec<manifest::InterfaceFile> =
+            ciborium::de::from_reader(interface_bytes.as_slice())
+                .context("decode interface section")?;
+        for file in &files {
+            add(
+                &mut zip,
+                &format!("interfaces/{}", file.name),
+                file.text.as_bytes(),
+                compression,
+            )?;
+        }
+    }
     let mut components = Vec::new();
     for (index, component) in artifact.manifest().components.iter().enumerate() {
         let path = format!("components/{index:04}.wasm");
@@ -193,32 +210,44 @@ pub fn export(
         add(&mut zip, &path, &bytes, compression)?;
         components.push(serde_json::json!({"name": component.name, "path": path}));
     }
-    zip.add_directory("payload/", options(0, compression).unix_permissions(0o755))?;
-    for (path, node) in nodes {
-        let target = format!("payload/{path}");
-        if node.kind == manifest::EntryKind::Dir {
-            zip.add_directory(
-                format!("{target}/"),
-                options(0, compression).unix_permissions(0o755),
-            )?;
-        } else {
-            zip.start_file(target, options(node.length, compression))?;
-            let mut hashes = Vec::new();
-            let mut pos = 0;
-            while pos < node.length {
-                let len = BLOCK.min(node.length - pos);
-                let (bytes, _) = artifact.read_payload_range(&format!("/{path}"), pos, len)?;
-                ensure!(bytes.len() as u64 == len, "short payload read");
-                hashes.push(payload::chunk_hash(&bytes));
-                zip.write_all(&bytes)?;
-                pos += len;
+    zip.add_directory("payloads/", options(0, compression).unix_permissions(0o755))?;
+    for (payload_index, (payload_name, nodes)) in payload_nodes.iter().enumerate() {
+        zip.add_directory(
+            format!("payloads/{payload_name}/"),
+            options(0, compression).unix_permissions(0o755),
+        )?;
+        for (path, node) in nodes {
+            let target = format!("payloads/{payload_name}/{path}");
+            if node.kind == manifest::EntryKind::Dir {
+                zip.add_directory(
+                    format!("{target}/"),
+                    options(0, compression).unix_permissions(0o755),
+                )?;
+            } else {
+                zip.start_file(target, options(node.length, compression))?;
+                // The mounted path the runtime resolves this file under.
+                let mounted = if payload_index == 0 {
+                    format!("/{path}")
+                } else {
+                    format!("/{payload_name}/{path}")
+                };
+                let mut hashes = Vec::new();
+                let mut pos = 0;
+                while pos < node.length {
+                    let len = BLOCK.min(node.length - pos);
+                    let (bytes, _) = artifact.read_payload_range(&mounted, pos, len)?;
+                    ensure!(bytes.len() as u64 == len, "short payload read");
+                    hashes.push(payload::chunk_hash(&bytes));
+                    zip.write_all(&bytes)?;
+                    pos += len;
+                }
+                // Also validate the plaintext file root for sealed artifacts
+                // and empty files, which do not trigger a runtime read.
+                ensure!(
+                    payload::merkle_root(&hashes)? == node.hash,
+                    "payload '{path}' hash mismatch"
+                );
             }
-            // Also validate the plaintext file root for sealed artifacts and
-            // empty files, which do not necessarily trigger a runtime read.
-            ensure!(
-                payload::merkle_root(&hashes)? == node.hash,
-                "payload '{path}' hash mismatch"
-            );
         }
     }
     for entry in entries
@@ -226,7 +255,7 @@ pub fn export(
         .filter(|e| matches!(e.tag, layout::TAG_SIGNATURE | layout::TAG_KEYBOX))
     {
         let name = if entry.tag == layout::TAG_SIGNATURE {
-            "signature.bin"
+            "signatures.cbor"
         } else {
             "keybox.bin"
         };

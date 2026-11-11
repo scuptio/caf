@@ -49,13 +49,13 @@ file. Sections are 8-byte aligned.
 +-----------------------------------+
 | Payload section(s)                |
 +-----------------------------------+
-| Signature        (ed25519)        |
+| Signature list   (CBOR)           |
 +-----------------------------------+
 ```
 
 A sealed artifact (`FLAG_ENCRYPTED`, §8) inserts two sections right after the
 directory — the **keybox** (recipient stanzas) and the encrypted **private
-manifest** — and stores a single encrypted **payload blob** instead of
+manifest** — and stores one encrypted **payload blob** per payload instead of
 per-file payload sections:
 
 ```text
@@ -67,22 +67,22 @@ per-file payload sections:
 +-----------------------------------+
 | WASM components  (ciphertext)     |
 +-----------------------------------+
-| Payload blob     (ciphertext)     |
+| Payload blob(s)  (ciphertext)     |
 +-----------------------------------+
 ```
 
 `Flags` is a `u16` bitfield. v1 defines two bits: `0x0001 SIGNED` — the
-artifact carries a 96-byte ed25519 signature section — and `0x0002 ENCRYPTED`
-— the artifact is sealed (§8). Readers **must reject an artifact carrying any
-unknown flag bit** (fail-closed): a reader that silently ignored a future flag
-— e.g. an encryption marker — would serve ciphertext as plaintext. New flags
-are therefore only ever introduced together with a `format_version` major bump
-(§12).
+artifact carries a signature section (a CBOR list of signature entries,
+§7) — and `0x0002 ENCRYPTED` — the artifact is sealed (§8). Readers **must
+reject an artifact carrying any unknown flag bit** (fail-closed): a reader
+that silently ignored a future flag — e.g. an encryption marker — would serve
+ciphertext as plaintext. New flags are therefore only ever introduced together
+with a `format_version` major bump (§12).
 
-Directory entry tags: `0` WASM component · `1` payload (file section, or the
-single payload blob in a sealed artifact) · `2` manifest (the envelope manifest
-in a sealed artifact) · `3` signature · `4` keybox · `5` private manifest.
-Readers reject unknown tags (fail-closed).
+Directory entry tags: `0` WASM component · `1` payload (file section, or one
+payload blob per payload in a sealed artifact) · `2` manifest (the envelope
+manifest in a sealed artifact) · `3` signature list · `4` keybox · `5` private
+manifest. Readers reject unknown tags (fail-closed).
 
 The **bootstrap header** is the only part that must be read eagerly (a few dozen
 bytes); manifest, interface, and directory are the "boot area" read on open (a
@@ -91,11 +91,16 @@ A remote artifact is thus opened after reading only the boot area plus the
 (small) component bytes — see §11 for the incremental-verification contract
 that makes this sound.
 
-The **section directory** is a fixed-width binary table (not CBOR): a `u32` entry
-count followed by `count` entries of `tag u8 | offset u64 | length u64 | hash
-[u8; 32]` (49 bytes each). Because every entry is fixed-width and the manifest
-carries *no* offsets, all section offsets are computed in a single forward pass —
-there is no self-referential layout to converge.
+The **section directory** is a fixed-width binary table (not CBOR): a `u32`
+entry count followed by `count` entries of `tag u8 | flags u8 | hash_alg u8 |
+reserved u8 | offset u64 | length u64 | hash [u8; 32]` (52 bytes each).
+`flags` carries per-section attributes (none defined in v1 — readers reject
+any nonzero bit), `hash_alg` tags the entry's hash algorithm (`0` = SHA-256;
+others rejected), and `reserved` must be zero — both fail-closed, so future
+attributes and hash algorithms land without a layout change. Because every
+entry is fixed-width and the manifest carries *no* offsets, all section
+offsets are computed in a single forward pass — there is no self-referential
+layout to converge.
 
 ## 2. Manifest
 
@@ -225,6 +230,11 @@ world computable-file {
 ```
 
 The container layer treats WIT as opaque text; all profile semantics live here.
+The section stores the sources as a **name-preserving CBOR list**
+`[{ name, text }]`, so original file names and boundaries survive the
+container (and round-trip through `export`/`import`); the build concatenates
+the texts in the declared order for parsing. An artifact without interfaces
+has a zero-length interface section.
 
 ## 4. WASM components
 
@@ -275,6 +285,7 @@ hashed.
 
 ```rust
 struct PayloadRef {
+    name: String,                    // mount name; the first payload is the default
     root: PayloadNode,               // directory tree root
     media_type: String,              // logical type (not physical format)
     length: u64,
@@ -293,6 +304,14 @@ struct PayloadNode {
 }
 ```
 
+An artifact carries **one or more named payload trees**. The first is the
+default payload: its tree is mounted at `/` in the guest filesystem; every
+other payload is mounted at `/<name>/`. Access scopes name their payload
+(`name:/path` in `build.toml`; the bare `/path` form addresses the default
+payload). Payload names must be unique, safe path segments, and must not
+collide with a top-level entry of the default payload — checked at build and
+again at verify/open (fail-closed).
+
 - **layout**: `opaque` (single chunk, whole-block read) / `range` (multi-chunk,
   range-readable) / `stream` (streaming). A file whose bytes fit in one chunk has
   `layout: opaque` and `chunks: []`; its hash is the plain SHA-256 of the bytes.
@@ -309,11 +328,9 @@ struct PayloadNode {
 - **uncompressed in v1**: the `compressed` field is reserved. Runtimes reject a
   non-`None` value at open time (fail-closed) rather than risk serving bytes a
   component cannot interpret. Chunk-aligned compression is a v2 topic.
-- **one tree in v1**: this format version carries exactly one payload tree;
-  the root-hash construction (§7) already leaves room for more.
-- **sealed payloads**: in a sealed artifact the per-file sections are replaced
-  by a single encrypted, pow2-padded payload blob, and the tree (with real
-  lengths and plaintext hashes) moves into the private manifest — see §8.
+- **sealed payloads**: in a sealed artifact each payload's per-file sections
+  are replaced by one encrypted, pow2-padded payload blob, and the trees (with
+  real lengths and plaintext hashes) move into the private manifest — see §8.
 
 ## 6. Execution profile & resource limits
 
@@ -353,25 +370,25 @@ All four budgets are enforced — none is a dead declaration:
 ## 7. Identity & verification
 
 ```text
-InterfaceHash   = SHA256(WIT text)
+InterfaceHash   = SHA256(interface section)
 WasmHash        = SHA256(each component bytes)
-PayloadRootHash = root hash of the payload tree (file hash = chunk-Merkle root;
-                  a single-chunk file hashes to the plain SHA-256 of its bytes)
+PayloadRootHash = root hash of each payload tree (file hash = chunk-Merkle
+                  root; a single-chunk file hashes to the plain SHA-256 of
+                  its bytes)
 ManifestHash    = SHA256(canonical manifest)          -- stored in the directory
 RootHash        = SHA256("CAF1"
                          || u64le(len) || ManifestHash
                          || u64le(len) || InterfaceHash
                          || u64le(n)   || (u64le(len) || WasmHash)*
-                         || u64le(len) || PayloadRootHash)
+                         || u64le(m)   || (u64le(len) || PayloadRootHash)*)
 FileId          = RootHash                             -- stored in the header
 ```
 
-The `"CAF1"` domain separator, explicit length prefixes, and the component count
-make the hash input unambiguous to parse and leave room for multiple payloads or
-a future hash-algorithm migration. Because the manifest hash transitively covers
+The `"CAF1"` domain separator, explicit length prefixes, and the component and
+payload counts make the hash input unambiguous to parse and leave room for a
+future hash-algorithm migration. Because the manifest hash transitively covers
 the policy, execution profile, interface ref, component refs, access scopes, and
-payload tree, binding strength is equivalent to hashing those fields directly.
-This format version carries exactly one payload tree.
+payload trees, binding strength is equivalent to hashing those fields directly.
 
 The manifest stores the interface/wasm/payload hashes (of the *other* sections);
 its own hash and the root hash are derived and stored outside the manifest (root
@@ -380,27 +397,32 @@ self-referential hashes and `SHA256(manifest)` always equals the stored
 `ManifestHash`. In a sealed artifact (§8) every section hash covers the *stored*
 bytes — ciphertext — so the root hash is the ciphertext identity.
 
-Signatures are ed25519 over the 32-byte **root hash**, which transitively covers
-every section. For sealed artifacts this is Encrypt-then-Sign: the signature
-binds the ciphertext identity and verifies without the content key; the
-signature section stays plaintext.
+The signature section is a CBOR **list of signature entries**, each
+`{ alg, key_id, pubkey, sig }` over the 32-byte **root hash**, which
+transitively covers every section. Every entry must verify; readers reject the
+artifact on the first invalid one (fail-closed). v1 defines `alg: "ed25519"`;
+co-signing, key rotation, and future algorithms are just additional entries.
+For sealed artifacts this is Encrypt-then-Sign: the signatures bind the
+ciphertext identity and verify without the content key; the signature section
+stays plaintext.
 Provenance distinguishes **data** / **algorithm** / **artifact**
 publishers.
 
 ### 7.1 Trust model
 
-The signature section carries `(pubkey, signature)`: the key needed to verify
-travels inside the file. A valid signature therefore proves **integrity and
+Each signature entry carries `(key_id, pubkey, signature)`: the key needed to
+verify travels inside the file, and `key_id` is the signer's fingerprint
+(`SHA256(pubkey)`, hex). A valid signature therefore proves **integrity and
 self-consistency** — the manifest was signed by the holder of the matching
 private key — but says nothing about *who* that holder is. Authenticity is
 established out of band:
 
-- **Signer fingerprint**: `SHA256(pubkey)`, hex-encoded. `caf-tool verify`
-  prints it for every signed artifact.
+- **Signer fingerprint**: `caf-tool verify` prints one per signature entry.
 - **Trust store**: consumers keep an external mapping from fingerprints to
   publisher identities. `caf-tool verify --trusted-keys keys.toml` resolves
-  the signer against it (TOML: `[keys] <fingerprint> = "publisher name"`), and
-  `--require-trusted` turns an unknown or unsigned artifact into a hard error.
+  each signer against it (TOML: `[keys] <fingerprint> = "publisher name"`),
+  and `--require-trusted` turns an artifact without at least one trusted,
+  valid signature into a hard error.
 - **TOFU by default**: without a trust store, first use of a fingerprint is a
   decision point for the consumer; distributions are expected to publish their
   fingerprint through a separate authenticated channel (project site, signed
@@ -410,7 +432,7 @@ established out of band:
   without it, verification degrades to "unverifiable" with a warning rather
   than rejection — integrity is still guaranteed by the hash chain.
 
-Multiple signers and certificate chains are v2 topics.
+Certificate chains are a v2 topic.
 
 ## 8. Sealed artifacts (encryption)
 
@@ -425,7 +447,7 @@ total payload size.
 content key (32 B, random per build — or convergent, see below)
   ├─ section key "private"      → AES-256-GCM encrypts the private manifest
   ├─ section key "component/<i>" → AES-256-GCM encrypts each component
-  └─ section key "payload"      → AES-256-GCM encrypts the payload blob
+  └─ section key "payload/<i>"  → AES-256-GCM encrypts each payload blob
                                     per 1 MiB chunk
 ```
 
@@ -447,18 +469,19 @@ content key (32 B, random per build — or convergent, see below)
   `format_version`, interface ref, capabilities, execution profile, resource
   limits, policy, the `encryption` block (`aead` / `wrap` / `padding`
   algorithm ids), anonymous ciphertext refs for the components, and refs for
-  the keybox / private / payload sections. Everything else moves into the
+  the keybox / private sections plus one `PayloadBlobRef` (name, lengths,
+  chunk count, ciphertext hash) per payload. Everything else moves into the
   private manifest.
 - **Private manifest** (encrypted, CBOR, `TAG_PRIVATE`): artifact name and
   version, provenance, per-component metadata (names, worlds, plaintext
-  hashes, exports, access scopes), and the payload tree.
-- **Payload blob**: all payload files concatenated in DFS order, zero-padded
-  to the **next power of two** (4 KiB floor; `padding: "pow2"`), split into
-  1 MiB chunks, each chunk sealed with the payload section key. The private
-  manifest's payload ref carries the real length, the padded length, and the
-  global ciphertext-chunk hash list; per-file plaintext hashes stay in the
-  tree. Publicly the directory leaks only the padded blob size — not the file
-  count or individual sizes.
+  hashes, exports, access scopes), and the payload trees.
+- **Payload blobs**: one per payload — all of its files concatenated in DFS
+  order, zero-padded to the **next power of two** (4 KiB floor; `padding:
+  "pow2"`), split into 1 MiB chunks, each chunk sealed with the payload's
+  section key (`payload/<i>`). The private manifest's payload refs carry the
+  real length, the padded length, and the ciphertext-chunk hash list;
+  per-file plaintext hashes stay in the tree. Publicly the directory leaks
+  only the padded blob sizes — not the file count or individual sizes.
 - **Reads**: a host decrypts the private manifest at open, then serves payload
   reads by fetching each covering ciphertext chunk, hash-checking it against
   the private manifest's chunk list, and only then decrypting (AEAD) and
@@ -539,7 +562,7 @@ Range endpoint, object storage). Opening reads and verifies only:
    interface (pinned by the manifest), and the section directory,
 3. each component's bytes (small; hash-verified, then admission enumerates
    their imports against the declared policy),
-4. the 96-byte signature section, if present.
+4. the signature list section, if present.
 
 The payload tree's structure (directory hashes) and every declared access
 scope are checked against the manifest at open. **Payload bytes are verified

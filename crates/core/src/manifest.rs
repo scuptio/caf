@@ -166,7 +166,7 @@ pub struct Manifest {
     pub policy: CapabilityPolicy,
     /// Publisher provenance for data, algorithm, and artifact.
     pub provenance: Provenance,
-    /// Payload trees (exactly one in format v1).
+    /// Payload trees. The first is the default payload (mounted at `/`).
     pub payloads: Vec<PayloadRef>,
     /// Content hashes of the other sections (interface / wasm / payload).
     pub hashes: SectionHashes,
@@ -219,6 +219,9 @@ pub struct ExportEntry {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct AccessScope {
+    /// Payload name (as declared on the `PayloadRef`); empty means the
+    /// default (first) payload.
+    pub payload: String,
     /// `/`-prefixed payload path.
     pub path: String,
     /// SHA-256 (hex) of the payload node at `path`.
@@ -306,6 +309,9 @@ impl Publisher {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadRef {
+    /// Payload name (unique within the artifact). The first payload is the
+    /// default: its tree is mounted at `/`, others at `/<name>/`.
+    pub name: String,
     /// Root node of the Merkle-hashed directory tree. In a sealed artifact the
     /// per-file hashes cover *plaintext* (identity after decryption).
     pub root: PayloadNode,
@@ -380,10 +386,13 @@ pub struct SectionRef {
     pub hash: String,
 }
 
-/// Reference to the single encrypted payload blob.
+/// Reference to one encrypted payload blob (one per payload, in manifest
+/// order).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct PayloadBlobRef {
+    /// Payload name (matches the private manifest's `PayloadRef`).
+    pub name: String,
     /// Byte length of the stored ciphertext (padded plaintext + per-chunk tags).
     pub length: u64,
     /// Padded plaintext length (power of two, >= 4096).
@@ -456,8 +465,44 @@ pub struct Envelope {
     pub private: SectionRef,
     /// Keybox section (plaintext recipient stanzas).
     pub keybox: SectionRef,
-    /// Encrypted payload blob.
-    pub payload: PayloadBlobRef,
+    /// Encrypted payload blobs (one per payload, in manifest order).
+    pub payloads: Vec<PayloadBlobRef>,
+}
+
+/// One file of the interface section: the WIT sources with their original
+/// names and boundaries preserved (the section stores this list as CBOR).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceFile {
+    /// Source file name (e.g. `geo.wit`).
+    pub name: String,
+    /// The WIT source text.
+    pub text: String,
+}
+
+/// Signature algorithm of a [`SignatureEntry`].
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SignatureAlgorithm {
+    /// ed25519 (RFC 8032, deterministic).
+    #[serde(rename = "ed25519")]
+    Ed25519,
+}
+
+/// One signature over the artifact root hash. The signature section stores a
+/// CBOR list of these, so co-signing, key rotation, and future algorithms are
+/// just additional entries. Unknown algorithms are reported but skipped by
+/// verifiers (they carry no authority a reader could check).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureEntry {
+    /// Signature algorithm.
+    pub alg: SignatureAlgorithm,
+    /// Signer fingerprint: SHA-256 (hex) of `pubkey` (as in trust stores).
+    pub key_id: String,
+    /// The signer's public key.
+    pub pubkey: serde_bytes::ByteBuf,
+    /// The signature over the artifact root hash.
+    pub sig: serde_bytes::ByteBuf,
 }
 
 /// A component's private metadata: everything the envelope hides.
@@ -489,6 +534,6 @@ pub struct PrivateManifest {
     pub components: Vec<PrivateComponent>,
     /// Publisher provenance for data, algorithm, and artifact.
     pub provenance: Provenance,
-    /// Payload trees (exactly one in format v1).
+    /// Payload trees. The first is the default payload (mounted at `/`).
     pub payloads: Vec<PayloadRef>,
 }

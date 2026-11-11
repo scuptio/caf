@@ -47,8 +47,6 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     );
 
     // manifest.cbor: the sole ordering authority (components, payload DFS).
-    // export_version 1 archives predate the format_version field; only
-    // container format v1 existed then.
     let manifest_bytes = read_entry(&mut zip, "manifest.cbor")?;
     let declared = match meta["format_version"].as_u64() {
         Some(v) => u32::try_from(v).context("export.json format_version out of range")?,
@@ -57,12 +55,17 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     let manifest = version::load_manifest(&manifest_bytes, declared)?;
     let manifest_hash = sha256(&manifest_bytes);
 
-    // Interface section.
-    let interface_bytes = read_entry(&mut zip, "interfaces/interface.wit")?;
+    // Interface section: the raw CBOR list (absent when the artifact declares
+    // no interfaces, i.e. a zero-length section).
+    let interface_bytes = if manifest.interface.length == 0 {
+        Vec::new()
+    } else {
+        read_entry(&mut zip, "interfaces.cbor")?
+    };
     ensure!(
         interface_bytes.len() as u64 == manifest.interface.length
             && hex::encode(&sha256(&interface_bytes)) == manifest.interface.hash,
-        "interface.wit does not match the manifest"
+        "interfaces.cbor does not match the manifest"
     );
 
     // Components, in manifest order.
@@ -80,41 +83,40 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
         component_blobs.push(bytes);
     }
 
-    // Payload files, in manifest DFS order; reject undeclared entries.
-    ensure!(
-        manifest.payloads.len() == 1,
-        "expected exactly one payload, found {}",
-        manifest.payloads.len()
-    );
-    let root = &manifest.payloads[0].root;
-    let mut file_list = Vec::new();
-    payload::collect_files(root, "", &mut file_list);
-    let mut declared = HashSet::with_capacity(file_list.len());
-    let mut payload_blobs = Vec::with_capacity(file_list.len());
-    for (path, hash, len) in &file_list {
-        let zip_path = format!("payload{path}");
-        let bytes = read_entry(&mut zip, &zip_path)?;
-        ensure!(
-            bytes.len() as u64 == *len && payload::verify_file(&bytes)? == *hash,
-            "payload '{path}' does not match the manifest"
-        );
-        declared.insert(zip_path);
-        payload_blobs.push(bytes);
+    // Payload files, payload by payload in manifest order, DFS within each
+    // tree; reject undeclared entries.
+    let mut declared = HashSet::new();
+    let mut payload_blobs = Vec::new();
+    let mut payload_root_hashes = Vec::with_capacity(manifest.payloads.len());
+    for payload_ref in &manifest.payloads {
+        let mut file_list = Vec::new();
+        payload::collect_files(&payload_ref.root, "", &mut file_list);
+        for (path, hash, len) in &file_list {
+            let zip_path = format!("payloads/{}{}", payload_ref.name, path);
+            let bytes = read_entry(&mut zip, &zip_path)?;
+            ensure!(
+                bytes.len() as u64 == *len && payload::verify_file(&bytes)? == *hash,
+                "payload '{path}' does not match the manifest"
+            );
+            declared.insert(zip_path);
+            payload_blobs.push(bytes);
+        }
+        payload_root_hashes.push(payload_ref.root.hash.clone());
     }
     for i in 0..zip.len() {
         let name = zip.by_index(i)?.name().to_string();
         ensure!(
-            !name.starts_with("payload/") || name.ends_with('/') || declared.contains(&name),
+            !name.starts_with("payloads/") || name.ends_with('/') || declared.contains(&name),
             "undeclared payload entry in ZIP: {name}"
         );
     }
 
-    // Optional signature section: stored verbatim, directory hash zero.
-    let signature = match zip.by_name("signature.bin") {
+    // Optional signature section: the CBOR signature list, stored verbatim;
+    // its directory hash is zero.
+    let signature = match zip.by_name("signatures.cbor") {
         Ok(mut entry) => {
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry.read_to_end(&mut bytes)?;
-            ensure!(bytes.len() == 96, "signature.bin must be 96 bytes");
             Some(bytes)
         }
         Err(zip::result::ZipError::FileNotFound) => None,
@@ -126,7 +128,7 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     let entry_count = 1 + component_blobs.len() + payload_blobs.len() + usize::from(signed);
     let directory_len = 4 + (entry_count * layout::DIRECTORY_ENTRY_SIZE) as u64;
     let component_lens: Vec<u64> = component_blobs.iter().map(|b| b.len() as u64).collect();
-    let file_lens: Vec<u64> = file_list.iter().map(|(_, _, len)| *len).collect();
+    let file_lens: Vec<u64> = payload_blobs.iter().map(|b| b.len() as u64).collect();
     let lay = layout::compute(
         manifest_bytes.len() as u64,
         interface_bytes.len() as u64,
@@ -137,37 +139,47 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
         None,
     );
     let mut entries = Vec::with_capacity(entry_count);
-    entries.push(layout::DirectoryEntry {
-        tag: layout::TAG_MANIFEST,
-        offset: lay.manifest_offset,
-        length: manifest_bytes.len() as u64,
-        hash: sha256(&manifest_bytes),
-    });
+    let dir_entry = |tag, offset, length, hash| layout::DirectoryEntry {
+        tag,
+        flags: 0,
+        hash_alg: layout::HASH_ALG_SHA256,
+        offset,
+        length,
+        hash,
+    };
+    entries.push(dir_entry(
+        layout::TAG_MANIFEST,
+        lay.manifest_offset,
+        manifest_bytes.len() as u64,
+        sha256(&manifest_bytes),
+    ));
     for (i, blob) in component_blobs.iter().enumerate() {
-        entries.push(layout::DirectoryEntry {
-            tag: layout::TAG_COMPONENT,
-            offset: lay.component_offsets[i],
-            length: blob.len() as u64,
-            hash: sha256(blob),
-        });
+        entries.push(dir_entry(
+            layout::TAG_COMPONENT,
+            lay.component_offsets[i],
+            blob.len() as u64,
+            sha256(blob),
+        ));
     }
-    for (i, (_, hash, len)) in file_list.iter().enumerate() {
-        entries.push(layout::DirectoryEntry {
-            tag: layout::TAG_PAYLOAD,
-            offset: lay.file_offsets[i],
-            length: *len,
-            hash: hex::decode(hash)?
+    for (i, blob) in payload_blobs.iter().enumerate() {
+        let hash = payload::verify_file(blob)?;
+        entries.push(dir_entry(
+            layout::TAG_PAYLOAD,
+            lay.file_offsets[i],
+            blob.len() as u64,
+            hex::decode(&hash)?
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("payload hash is not 32 bytes"))?,
-        });
+        ));
     }
     if signed {
-        entries.push(layout::DirectoryEntry {
-            tag: layout::TAG_SIGNATURE,
-            offset: lay.signature_offset,
-            length: 96,
-            hash: [0u8; 32],
-        });
+        let sig_len = signature.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+        entries.push(dir_entry(
+            layout::TAG_SIGNATURE,
+            lay.signature_offset,
+            sig_len,
+            [0u8; 32],
+        ));
     }
     let directory_bytes = layout::encode_directory(&entries);
 
@@ -178,7 +190,7 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
         &hex::encode(&manifest_hash),
         &manifest.interface.hash,
         &component_hashes,
-        &root.hash,
+        &payload_root_hashes,
     )?;
     if let Some(expected) = meta["root_hash"].as_str() {
         ensure!(
@@ -215,7 +227,7 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
         verify::verify_bytes(&out).context("reconstructed artifact failed verification")?;
     ensure!(
         !signed || report.signature_valid == Some(true),
-        "signature.bin does not verify against the reconstructed artifact"
+        "signatures.cbor does not verify against the reconstructed artifact"
     );
 
     // Atomic publish: write beside the destination, fsync, then rename.

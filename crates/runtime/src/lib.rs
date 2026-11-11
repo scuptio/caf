@@ -125,21 +125,27 @@ pub struct Artifact {
 }
 
 /// Decryption state of a sealed (`FLAG_ENCRYPTED`) artifact. The synthesized
-/// `manifest` holds the plaintext view (names, tree, access scopes); this
+/// `manifest` holds the plaintext view (names, trees, access scopes); this
 /// state holds what the stored ciphertext needs.
 struct SealedState {
     /// The unwrapped 32-byte content key.
     content_key: [u8; 32],
-    /// Absolute offset of the payload ciphertext blob section.
+    /// Per-payload blob state, in manifest payload order.
+    payloads: Vec<SealedPayload>,
+    /// SHA-256 (hex) of each component's *plaintext* bytes.
+    component_plaintext_hashes: Vec<String>,
+}
+
+/// Per-payload blob geometry of a sealed artifact.
+struct SealedPayload {
+    /// Absolute offset of this payload's ciphertext blob section.
     blob_offset: u64,
     /// Padded plaintext length (power of two).
     padded_length: u64,
-    /// Global ciphertext chunk hashes of the payload blob.
+    /// Ciphertext chunk hashes of this blob.
     ct_chunk_hashes: Vec<String>,
-    /// Path → (start offset within the plaintext blob, real length).
+    /// Tree-relative path → (start offset within the plaintext blob, real length).
     file_starts: HashMap<String, (u64, u64)>,
-    /// SHA-256 (hex) of each component's *plaintext* bytes.
-    component_plaintext_hashes: Vec<String>,
 }
 
 /// Verified-chunk LRU with a fixed capacity (64 × 1 MiB chunks max).
@@ -204,9 +210,20 @@ impl ArtifactContents {
         self.0.root_hash()
     }
 
-    /// Payload file paths, Merkle hashes and byte lengths, in stored order.
-    pub fn payload_entries(&self) -> Vec<(String, String, u64)> {
-        self.0.payload_entries()
+    /// Payload files per payload: `(payload, path, Merkle hash, length)`, in
+    /// stored order (payload by payload, DFS within each tree).
+    pub fn payload_entries(&self) -> Vec<(String, String, String, u64)> {
+        let mut out = Vec::new();
+        for p in &self.0.manifest.payloads {
+            let mut files = Vec::new();
+            payload::collect_files(&p.root, "", &mut files);
+            out.extend(
+                files
+                    .into_iter()
+                    .map(|(path, hash, len)| (p.name.clone(), path, hash, len)),
+            );
+        }
+        out
     }
 
     /// Read a verified plaintext payload range; see `Artifact::read_payload_range`.
@@ -290,26 +307,23 @@ impl Artifact {
             bail!("interface hash mismatch");
         }
 
-        // Exactly one payload tree in this format version; compression is
-        // reserved — refuse compressed payloads rather than serving bytes the
-        // component cannot interpret.
-        if manifest.payloads.len() != 1 {
-            bail!(
-                "expected exactly one payload tree, got {}",
-                manifest.payloads.len()
-            );
+        // Compression is reserved — refuse compressed payloads rather than
+        // serving bytes the component cannot interpret. Payload tree
+        // structure and access scopes check against the manifest alone;
+        // payload bytes verify lazily, per chunk, on first read.
+        payload::validate_payloads(&manifest.payloads)?;
+        let mut payload_root_hashes = Vec::with_capacity(manifest.payloads.len());
+        for payload_ref in &manifest.payloads {
+            if payload_ref.compressed.is_some() {
+                bail!("payload compression is reserved in format v1 (not yet implemented)");
+            }
+            payload::verify_tree(&payload_ref.root)?;
+            payload_root_hashes.push(payload_ref.root.hash.clone());
         }
-        if manifest.payloads[0].compressed.is_some() {
-            bail!("payload compression is reserved in format v1 (not yet implemented)");
-        }
-        let payload_root = &manifest.payloads[0].root;
-
-        // Payload tree structure and access scopes check against the manifest
-        // alone; payload bytes verify lazily, per chunk, on first read.
-        payload::verify_tree(payload_root)?;
         for comp in &manifest.components {
             for scope in &comp.access {
-                let node = payload::find(payload_root, &scope.path)
+                let payload_ref = payload::resolve_payload(&manifest.payloads, &scope.payload)?;
+                let node = payload::find(&payload_ref.root, &scope.path)
                     .with_context(|| format!("access scope '{}' not found", scope.path))?;
                 if node.hash != scope.hash {
                     bail!("access scope '{}' hash mismatch", scope.path);
@@ -354,31 +368,15 @@ impl Artifact {
             &manifest_hash,
             &interface_hash,
             &wasm_hashes,
-            &payload_root.hash,
+            &payload_root_hashes,
         )?;
         if root_hash != header.root_hash {
             bail!("root hash mismatch");
         }
 
-        // The signature section is 96 bytes; verify it at open. The signature
-        // covers the header root hash (Encrypt-then-Sign for sealed artifacts;
-        // the same rule keeps plaintext artifacts uniform).
-        if header.flags & layout::FLAG_SIGNED != 0 {
-            let sig_entry = directory
-                .iter()
-                .find(|e| e.tag == layout::TAG_SIGNATURE)
-                .context("signed artifact has no signature directory entry")?;
-            let sig_bytes = source.read_at(sig_entry.offset, sig_entry.length)?;
-            if sig_bytes.len() != 96 {
-                bail!(
-                    "signature section has unexpected length {}",
-                    sig_bytes.len()
-                );
-            }
-            if !payload::verify_signature(&sig_bytes[..32], &sig_bytes[32..], &root_hash) {
-                bail!("invalid signature");
-            }
-        }
+        // Verify every signature over the root hash at open
+        // (Encrypt-then-Sign for sealed artifacts; plaintext is uniform).
+        verify_signatures(&source, &directory, &root_hash, header.flags)?;
 
         if admit {
             // Admission, part 1: a declared-but-unsupported capability is a hard
@@ -465,10 +463,12 @@ impl Artifact {
         let private: manifest::PrivateManifest =
             ciborium::de::from_reader(private_plain.as_slice())
                 .context("decode private manifest")?;
-        if private.payloads.len() != 1 {
+        payload::validate_payloads(&private.payloads)?;
+        if private.payloads.len() != envelope.payloads.len() {
             bail!(
-                "expected exactly one payload tree, got {}",
-                private.payloads.len()
+                "private/envelope payload count mismatch: {}, {}",
+                private.payloads.len(),
+                envelope.payloads.len()
             );
         }
         if private.components.len() != envelope.components.len() {
@@ -512,43 +512,77 @@ impl Artifact {
             }
         }
 
-        // Payload blob: one ciphertext section; lazy per-chunk verify+decrypt
-        // on read.
+        // Payload blobs: one ciphertext section per payload; lazy per-chunk
+        // verify+decrypt on read.
         let payload_entries: Vec<_> = directory
             .iter()
             .filter(|e| e.tag == layout::TAG_PAYLOAD)
             .collect();
-        if payload_entries.len() != 1 {
-            bail!("sealed artifact must carry exactly one payload blob");
+        if payload_entries.len() != envelope.payloads.len() {
+            bail!(
+                "payload blob count mismatch: directory {}, envelope {}",
+                payload_entries.len(),
+                envelope.payloads.len()
+            );
         }
-        let blob_entry = payload_entries[0];
-        let payload_ref = &private.payloads[0];
-        let padded_length = payload_ref
-            .padded_length
-            .context("sealed payload ref misses padded_length")?;
-        if payload::chunk_count(padded_length) != payload_ref.chunks.len() as u64 {
-            bail!("payload chunk hash count mismatch");
-        }
-        let blob_len =
-            padded_length + payload_ref.chunks.len() as u64 * crypto::AEAD_TAG_LEN as u64;
-        if blob_entry.length != blob_len || blob_entry.length != envelope.payload.length {
-            bail!("payload blob length mismatch");
-        }
-        // The blob's bytes verify lazily, per ciphertext chunk, on first read
-        // (the whole-blob hash is checked by the eager `verify` path only);
-        // the directory entry must still agree with the envelope.
-        let blob_hash = envelope.payload.hash.clone();
-        if blob_entry.hash != decode_hash(&blob_hash)? {
-            bail!("payload blob directory hash mismatch");
+        let mut sealed_payloads = Vec::with_capacity(envelope.payloads.len());
+        let mut blob_hashes = Vec::with_capacity(envelope.payloads.len());
+        for (i, payload_ref) in private.payloads.iter().enumerate() {
+            let blobref = &envelope.payloads[i];
+            if payload_ref.name != blobref.name {
+                bail!("private/envelope payload name mismatch at index {i}");
+            }
+            let blob_entry = payload_entries[i];
+            let padded_length = payload_ref
+                .padded_length
+                .context("sealed payload ref misses padded_length")?;
+            if padded_length != blobref.padded_length {
+                bail!("payload '{}' padded length mismatch", payload_ref.name);
+            }
+            if payload::chunk_count(padded_length) != payload_ref.chunks.len() as u64 {
+                bail!("payload chunk hash count mismatch");
+            }
+            let blob_len =
+                padded_length + payload_ref.chunks.len() as u64 * crypto::AEAD_TAG_LEN as u64;
+            if blob_entry.length != blob_len || blob_entry.length != blobref.length {
+                bail!("payload blob length mismatch");
+            }
+            // The blob's bytes verify lazily, per ciphertext chunk, on first
+            // read (the whole-blob hash is checked by the eager `verify` path
+            // only); the directory entry must still agree with the envelope.
+            if blob_entry.hash != decode_hash(&blobref.hash)? {
+                bail!("payload blob directory hash mismatch");
+            }
+            blob_hashes.push(blobref.hash.clone());
+
+            let mut file_starts = HashMap::new();
+            let mut at = 0u64;
+            let mut file_list = Vec::new();
+            payload::collect_files(&payload_ref.root, "", &mut file_list);
+            for (path, _hash, len) in &file_list {
+                file_starts.insert(path.clone(), (at, *len));
+                at += len;
+            }
+            if at != payload_ref.length {
+                bail!("payload real length mismatch");
+            }
+            sealed_payloads.push(SealedPayload {
+                blob_offset: blob_entry.offset,
+                padded_length,
+                ct_chunk_hashes: payload_ref.chunks.clone(),
+                file_starts,
+            });
         }
 
-        // Payload tree structure and access scopes check against the private
+        // Payload tree structures and access scopes check against the private
         // manifest alone; payload bytes verify per chunk on first read.
-        let payload_root = &payload_ref.root;
-        payload::verify_tree(payload_root)?;
+        for payload_ref in &private.payloads {
+            payload::verify_tree(&payload_ref.root)?;
+        }
         for comp in &private.components {
             for scope in &comp.access {
-                let node = payload::find(payload_root, &scope.path)
+                let payload_ref = payload::resolve_payload(&private.payloads, &scope.payload)?;
+                let node = payload::find(&payload_ref.root, &scope.path)
                     .with_context(|| format!("access scope '{}' not found", scope.path))?;
                 if node.hash != scope.hash {
                     bail!("access scope '{}' hash mismatch", scope.path);
@@ -561,29 +595,14 @@ impl Artifact {
             &envelope_hash,
             &interface_hash,
             &component_ct_hashes,
-            &blob_hash,
+            &blob_hashes,
         )?;
         if root_hash != header.root_hash {
             bail!("root hash mismatch");
         }
 
-        // Signature over the ciphertext root hash (Encrypt-then-Sign).
-        if header.flags & layout::FLAG_SIGNED != 0 {
-            let sig_entry = directory
-                .iter()
-                .find(|e| e.tag == layout::TAG_SIGNATURE)
-                .context("signed artifact has no signature directory entry")?;
-            let sig_bytes = source.read_at(sig_entry.offset, sig_entry.length)?;
-            if sig_bytes.len() != 96 {
-                bail!(
-                    "signature section has unexpected length {}",
-                    sig_bytes.len()
-                );
-            }
-            if !payload::verify_signature(&sig_bytes[..32], &sig_bytes[32..], &root_hash) {
-                bail!("invalid signature");
-            }
-        }
+        // Signatures over the ciphertext root hash (Encrypt-then-Sign).
+        verify_signatures(&source, &directory, &root_hash, header.flags)?;
 
         // Synthesize the plaintext manifest view the rest of the runtime (and
         // the host ABI) works against.
@@ -614,21 +633,9 @@ impl Artifact {
             hashes: manifest::SectionHashes {
                 interface: envelope.interface.hash.clone(),
                 wasm: envelope.components.iter().map(|c| c.hash.clone()).collect(),
-                payload: vec![envelope.payload.hash.clone()],
+                payload: envelope.payloads.iter().map(|p| p.hash.clone()).collect(),
             },
         };
-
-        let mut file_starts = HashMap::new();
-        let mut at = 0u64;
-        let mut file_list = Vec::new();
-        payload::collect_files(&manifest.payloads[0].root, "", &mut file_list);
-        for (path, _hash, len) in &file_list {
-            file_starts.insert(path.clone(), (at, *len));
-            at += len;
-        }
-        if at != payload_ref.length {
-            bail!("payload real length mismatch");
-        }
 
         if admit {
             // Admission: identical policy gates to the plaintext path.
@@ -645,10 +652,7 @@ impl Artifact {
 
         let sealed = SealedState {
             content_key,
-            blob_offset: blob_entry.offset,
-            padded_length,
-            ct_chunk_hashes: payload_ref.chunks.clone(),
-            file_starts,
+            payloads: sealed_payloads,
             component_plaintext_hashes: private.components.iter().map(|c| c.hash.clone()).collect(),
         };
 
@@ -688,26 +692,40 @@ impl Artifact {
     }
 
     /// `(path, length)` for every payload file, in deterministic DFS order.
+    /// Non-default payloads are mounted under `/<name>/`.
     pub fn payload_files(&self) -> Vec<(String, u64)> {
-        let mut files = Vec::new();
-        payload::collect_files(&self.manifest.payloads[0].root, "", &mut files);
-        files
+        self.mounted_files()
             .into_iter()
             .map(|(path, _hash, len)| (path, len))
             .collect()
     }
 
-    /// `(path, hash, length)` for every payload file, in deterministic DFS order.
+    /// `(path, hash, length)` for every payload file, in deterministic DFS
+    /// order (mounted paths).
     pub fn payload_entries(&self) -> Vec<(String, String, u64)> {
-        let mut files = Vec::new();
-        payload::collect_files(&self.manifest.payloads[0].root, "", &mut files);
-        files
+        self.mounted_files()
     }
 
-    /// Read a payload file's bytes by its `/`-prefixed path.
+    /// All payload files with mounted paths: the default (first) payload is
+    /// mounted at `/`, others at `/<name>/`.
+    fn mounted_files(&self) -> Vec<(String, String, u64)> {
+        let mut out = Vec::new();
+        for (i, p) in self.manifest.payloads.iter().enumerate() {
+            let mut files = Vec::new();
+            payload::collect_files(&p.root, "", &mut files);
+            out.extend(
+                files
+                    .into_iter()
+                    .map(|(path, hash, len)| (mount_path(i, &p.name, &path), hash, len)),
+            );
+        }
+        out
+    }
+
+    /// Read a payload file's bytes by its `/`-prefixed (mounted) path.
     pub fn read_payload(&self, path: &str) -> Result<Vec<u8>> {
         let map = self.payload_map()?;
-        let &(_offset, length) = map
+        let &(_payload, _offset, length) = map
             .get(path)
             .with_context(|| format!("payload '{path}' not found"))?;
         Ok(self.read_payload_range(path, 0, length)?.0)
@@ -729,7 +747,7 @@ impl Artifact {
         mut meter: Option<&mut Meter>,
     ) -> Result<(Vec<u8>, u64)> {
         let map = self.payload_map()?;
-        let &(offset, flen) = map
+        let &(payload_idx, offset, flen) = map
             .get(path)
             .with_context(|| format!("payload '{path}' not found"))?;
         if len > flen || pos > flen - len {
@@ -739,13 +757,15 @@ impl Artifact {
             return Ok((Vec::new(), 0));
         }
 
-        // Sealed artifact: `offset` is the file's start within the plaintext
-        // blob; covering ciphertext chunks are hash-verified, then decrypted.
+        // Sealed artifact: `offset` is the file's start within the payload's
+        // plaintext blob; covering ciphertext chunks are hash-verified, then
+        // decrypted.
         if let Some(sealed) = &self.sealed {
-            return self.read_sealed_range(sealed, offset, pos, len, meter);
+            return self.read_sealed_range(sealed, payload_idx, offset, pos, len, meter);
         }
 
-        let node = payload::find(&self.manifest.payloads[0].root, path)
+        let inner = self.resolve_payload_path(path)?.1;
+        let node = payload::find(&self.manifest.payloads[payload_idx].root, &inner)
             .with_context(|| format!("payload '{path}' not in tree"))?;
 
         let mut fetched = 0u64;
@@ -795,6 +815,7 @@ impl Artifact {
     fn read_sealed_range(
         &self,
         sealed: &SealedState,
+        payload_idx: usize,
         file_start: u64,
         pos: u64,
         len: u64,
@@ -809,8 +830,13 @@ impl Artifact {
         let mut fetched = 0u64;
         let mut index = first;
         while index <= last {
-            let chunk =
-                self.fetch_chunk_sealed(sealed, index, &mut fetched, meter.as_deref_mut())?;
+            let chunk = self.fetch_chunk_sealed(
+                sealed,
+                payload_idx,
+                index,
+                &mut fetched,
+                meter.as_deref_mut(),
+            )?;
             let chunk_base = index * chunk_size;
             let from =
                 usize::try_from(abs_start.saturating_sub(chunk_base)).context("offset range")?;
@@ -822,18 +848,21 @@ impl Artifact {
         Ok((out, fetched))
     }
 
-    /// Fetch ciphertext chunk `index` of a sealed payload blob, hash-verify,
-    /// decrypt, and cache the plaintext (LRU, keyed by ciphertext offset).
+    /// Fetch ciphertext chunk `index` of payload `payload_idx`'s sealed blob,
+    /// hash-verify, decrypt, and cache the plaintext (LRU, keyed by ciphertext
+    /// offset, which is unique across blobs).
     fn fetch_chunk_sealed(
         &self,
         sealed: &SealedState,
+        payload_idx: usize,
         index: u64,
         fetched: &mut u64,
         meter: Option<&mut Meter>,
     ) -> Result<Vec<u8>> {
+        let blob = &sealed.payloads[payload_idx];
         let chunk_size = manifest::CHUNK_SIZE as u64;
-        let plain_len = chunk_size.min(sealed.padded_length - index * chunk_size);
-        let ct_off = sealed.blob_offset + index * (chunk_size + crypto::AEAD_TAG_LEN as u64);
+        let plain_len = chunk_size.min(blob.padded_length - index * chunk_size);
+        let ct_off = blob.blob_offset + index * (chunk_size + crypto::AEAD_TAG_LEN as u64);
         let ct_len = plain_len + crypto::AEAD_TAG_LEN as u64;
         {
             let mut cache = self
@@ -847,14 +876,15 @@ impl Artifact {
         charge_fetch(meter, ct_len)?;
         let ct = self.source.read_at(ct_off, ct_len)?;
         *fetched += ct_len;
-        let expected = sealed
+        let expected = blob
             .ct_chunk_hashes
             .get(usize::try_from(index).context("chunk index out of range")?)
             .context("chunk hash missing")?;
         if &payload::chunk_hash(&ct) != expected {
             bail!("payload chunk {index} ciphertext hash mismatch");
         }
-        let payload_key = crypto::section_key(&sealed.content_key, "payload");
+        let payload_key =
+            crypto::section_key(&sealed.content_key, &format!("payload/{payload_idx}"));
         let plain = crypto::open_chunk(&payload_key, index, &ct)?;
         self.chunk_cache
             .lock()
@@ -897,31 +927,89 @@ impl Artifact {
         Ok(data)
     }
 
-    fn payload_map(&self) -> Result<HashMap<String, (u64, u64)>> {
-        // Sealed artifact: paths map into the plaintext blob (offset, real
-        // length); decryption happens in the read path.
+    /// Mounted path → (payload index, byte offset, length). Offsets are
+    /// section offsets (plaintext artifacts) or blob-relative starts
+    /// (sealed; decryption happens in the read path).
+    fn payload_map(&self) -> Result<HashMap<String, (usize, u64, u64)>> {
         if let Some(sealed) = &self.sealed {
-            return Ok(sealed.file_starts.clone());
+            let mut map = HashMap::new();
+            for (i, blob) in sealed.payloads.iter().enumerate() {
+                for (path, &(start, len)) in &blob.file_starts {
+                    map.insert(
+                        mount_path(i, &self.manifest.payloads[i].name, path),
+                        (i, start, len),
+                    );
+                }
+            }
+            return Ok(map);
         }
-        let mut files = Vec::new();
-        payload::collect_files(&self.manifest.payloads[0].root, "", &mut files);
         let entries: Vec<_> = self
             .directory
             .iter()
             .filter(|e| e.tag == layout::TAG_PAYLOAD)
             .collect();
-        if entries.len() != files.len() {
+        let total: usize = self
+            .manifest
+            .payloads
+            .iter()
+            .map(|p| {
+                let mut files = Vec::new();
+                payload::collect_files(&p.root, "", &mut files);
+                files.len()
+            })
+            .sum();
+        if entries.len() != total {
             bail!(
                 "payload directory/file count mismatch: {} vs {}",
                 entries.len(),
-                files.len()
+                total
             );
         }
         let mut map = HashMap::new();
-        for (i, (path, _hash, _len)) in files.iter().enumerate() {
-            map.insert(path.clone(), (entries[i].offset, entries[i].length));
+        let mut next = 0;
+        for (i, p) in self.manifest.payloads.iter().enumerate() {
+            let mut files = Vec::new();
+            payload::collect_files(&p.root, "", &mut files);
+            for (path, _hash, _len) in files {
+                let e = entries[next];
+                next += 1;
+                map.insert(mount_path(i, &p.name, &path), (i, e.offset, e.length));
+            }
         }
         Ok(map)
+    }
+
+    /// Resolve a mounted guest path to (payload index, tree-relative path):
+    /// a leading segment matching a non-default payload name selects that
+    /// payload, everything else lands in the default payload.
+    fn resolve_payload_path(&self, path: &str) -> Result<(usize, String)> {
+        let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+        for (i, p) in self.manifest.payloads.iter().enumerate().skip(1) {
+            if p.name == first {
+                let inner = path
+                    .strip_prefix(&format!("/{first}"))
+                    .filter(|s| s.starts_with('/') || s.is_empty())
+                    .unwrap_or("/");
+                return Ok((i, inner.to_string()));
+            }
+        }
+        Ok((0, path.to_string()))
+    }
+
+    /// The mounted path of an access scope: the default payload keeps its
+    /// tree-relative path; other payloads are prefixed with their name.
+    fn mount_scope(&self, scope: &manifest::AccessScope) -> Result<String> {
+        let payloads = &self.manifest.payloads;
+        let resolved = payload::resolve_payload(payloads, &scope.payload)?;
+        let is_default = payloads
+            .first()
+            .map(|p| p.name == resolved.name)
+            .unwrap_or(false);
+        if is_default {
+            Ok(scope.path.clone())
+        } else {
+            Ok(format!("/{}{}", resolved.name, scope.path))
+        }
     }
 
     /// Read and verify a component, decrypting it when the artifact is sealed.
@@ -966,6 +1054,54 @@ fn charge_fetch(meter: Option<&mut Meter>, len: u64) -> Result<()> {
     Ok(())
 }
 
+/// The guest-visible path of a payload file: the default (first) payload is
+/// mounted at `/`, others at `/<name>/`.
+fn mount_path(index: usize, name: &str, tree_path: &str) -> String {
+    if index == 0 {
+        tree_path.to_string()
+    } else {
+        format!("/{name}{tree_path}")
+    }
+}
+
+/// Verify every signature in the signature section against the root hash.
+/// The section is a CBOR list of entries; every entry must carry an honest
+/// key_id and a signature that verifies (fail-closed).
+fn verify_signatures(
+    source: &Arc<dyn PayloadSource>,
+    directory: &[layout::DirectoryEntry],
+    root_hash: &[u8; 32],
+    flags: u16,
+) -> Result<()> {
+    if flags & layout::FLAG_SIGNED == 0 {
+        return Ok(());
+    }
+    let entry = directory
+        .iter()
+        .find(|e| e.tag == layout::TAG_SIGNATURE)
+        .context("signed artifact has no signature directory entry")?;
+    let bytes = source.read_at(entry.offset, entry.length)?;
+    let signatures: Vec<manifest::SignatureEntry> =
+        ciborium::de::from_reader(bytes.as_slice()).context("decode signature section")?;
+    if signatures.is_empty() {
+        bail!("signature section is empty");
+    }
+    for entry in &signatures {
+        match entry.alg {
+            manifest::SignatureAlgorithm::Ed25519 => {
+                if entry.key_id != payload::signer_fingerprint(entry.pubkey.as_ref()) {
+                    bail!("signature key_id does not match its public key");
+                }
+                if !payload::verify_signature(entry.pubkey.as_ref(), entry.sig.as_ref(), root_hash)
+                {
+                    bail!("invalid signature");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn decode_hash(hex_str: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_str)?;
     bytes
@@ -1000,21 +1136,47 @@ struct HostState {
 }
 
 fn build_fs(artifact: &Artifact, access: &[manifest::AccessScope]) -> Result<Fs> {
-    let root = &artifact.manifest.payloads[0].root;
     let offsets = artifact.payload_map()?;
+    // Scopes translated to mounted paths: the default payload keeps its
+    // tree-relative paths; other payloads are prefixed with their name.
+    let mut mounted_scopes = Vec::with_capacity(access.len());
+    for scope in access {
+        mounted_scopes.push(artifact.mount_scope(scope)?);
+    }
+    // Synthetic merged namespace: the default payload's tree at "/", each
+    // other payload as a top-level directory named after it.
+    let mut children = Vec::new();
+    for (i, p) in artifact.manifest.payloads.iter().enumerate() {
+        if i == 0 {
+            children.extend(p.root.entries.iter().cloned());
+        } else {
+            let mut node = p.root.clone();
+            node.name = p.name.clone();
+            children.push(node);
+        }
+    }
+    let root = manifest::PayloadNode {
+        kind: manifest::EntryKind::Dir,
+        name: String::new(),
+        hash: String::new(),
+        length: 0,
+        layout: None,
+        chunks: Vec::new(),
+        entries: children,
+    };
     let mut fs = Fs {
         files: HashMap::new(),
         dirs: HashMap::new(),
     };
-    build_fs_rec(root, "/", access, &offsets, &mut fs)?;
+    build_fs_rec(&root, "/", &mounted_scopes, &offsets, &mut fs)?;
     Ok(fs)
 }
 
 fn build_fs_rec(
     node: &manifest::PayloadNode,
     path: &str,
-    access: &[manifest::AccessScope],
-    offsets: &HashMap<String, (u64, u64)>,
+    access: &[String],
+    offsets: &HashMap<String, (usize, u64, u64)>,
     fs: &mut Fs,
 ) -> Result<()> {
     if !is_reachable(path, access) {
@@ -1024,7 +1186,7 @@ fn build_fs_rec(
         let desc = offsets
             .get(path)
             .with_context(|| format!("payload '{path}' has no directory entry"))?;
-        fs.files.insert(path.to_string(), *desc);
+        fs.files.insert(path.to_string(), (desc.1, desc.2));
         return Ok(());
     }
     let mut names = Vec::new();
@@ -1044,13 +1206,14 @@ fn build_fs_rec(
 }
 
 /// A node is reachable if it is an ancestor of, equal to, or descendant of a
-/// declared access scope. `access = []` yields an empty filesystem (deny all).
-fn is_reachable(path: &str, access: &[manifest::AccessScope]) -> bool {
+/// declared (mounted) access scope. No scopes yields an empty filesystem
+/// (deny all).
+fn is_reachable(path: &str, access: &[String]) -> bool {
     if path == "/" {
         return !access.is_empty();
     }
-    for scope in access {
-        let sp = scope.path.trim_end_matches('/');
+    for sp in access {
+        let sp = sp.trim_end_matches('/');
         if sp.is_empty() {
             return true;
         }

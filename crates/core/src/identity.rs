@@ -7,7 +7,7 @@
 //!                   || u64le(len) || ManifestHash
 //!                   || u64le(len) || InterfaceHash
 //!                   || u64le(n)   || (u64le(len) || WasmHash)*
-//!                   || u64le(len) || PayloadRootHash)
+//!                   || u64le(m)   || (u64le(len) || PayloadRootHash)*)
 //! ```
 //!
 //! The domain separator, length prefixes, and explicit component count make the
@@ -37,7 +37,7 @@ pub fn root_hash(
     manifest_hash: &str,
     interface_hash: &str,
     wasm_hashes: &[String],
-    payload_root_hash: &str,
+    payload_root_hashes: &[String],
 ) -> Result<[u8; 32]> {
     let mut h = Sha256::new();
     h.update(ROOT_DOMAIN);
@@ -47,7 +47,10 @@ pub fn root_hash(
     for w in wasm_hashes {
         write_prefixed(&mut h, w)?;
     }
-    write_prefixed(&mut h, payload_root_hash)?;
+    h.update((payload_root_hashes.len() as u64).to_le_bytes());
+    for p in payload_root_hashes {
+        write_prefixed(&mut h, p)?;
+    }
     let digest = h.finalize();
     let mut raw = [0u8; 32];
     raw.copy_from_slice(&digest);

@@ -45,19 +45,33 @@ pub const KNOWN_TAGS: [u8; 6] = [
     TAG_PRIVATE,
 ];
 
-/// Fixed-width directory entry: `tag u8` + `offset u64` + `length u64` + `hash [u8;32]`.
-pub const DIRECTORY_ENTRY_SIZE: usize = 1 + 8 + 8 + 32;
+/// Fixed-width directory entry: `tag u8` + `flags u8` + `hash_alg u8` +
+/// `reserved u8` (zero) + `offset u64` + `length u64` + `hash [u8;32]`.
+pub const DIRECTORY_ENTRY_SIZE: usize = 1 + 1 + 1 + 1 + 8 + 8 + 32;
+
+/// Directory entry flag: the section is compressed. Reserved in format v1 —
+/// no reader supports it yet, so it is rejected on sight (fail-closed).
+pub const ENTRY_FLAG_COMPRESSED: u8 = 0x01;
+/// Entry flags a v1 reader accepts; any other bit is rejected (fail-closed).
+pub const KNOWN_ENTRY_FLAGS: u8 = 0;
+
+/// Directory entry hash algorithm: SHA-256 (the only algorithm in v1).
+pub const HASH_ALG_SHA256: u8 = 0;
 
 /// One section-directory entry: a typed `(offset, length, hash)` pointer into
-/// the artifact.
+/// the artifact, with per-section attribute flags and a tagged hash algorithm.
 pub struct DirectoryEntry {
     /// Section kind (`TAG_*`).
     pub tag: u8,
+    /// Per-section attributes (`ENTRY_FLAG_*`; none defined for v1 readers).
+    pub flags: u8,
+    /// Hash algorithm of `hash` (`HASH_ALG_*`).
+    pub hash_alg: u8,
     /// Absolute byte offset of the section.
     pub offset: u64,
     /// Byte length of the section.
     pub length: u64,
-    /// SHA-256 of the section bytes.
+    /// Hash of the section bytes (SHA-256 in v1).
     pub hash: [u8; 32],
 }
 
@@ -188,6 +202,9 @@ pub fn encode_directory(entries: &[DirectoryEntry]) -> Vec<u8> {
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
         out.push(e.tag);
+        out.push(e.flags);
+        out.push(e.hash_alg);
+        out.push(0); // reserved
         out.extend_from_slice(&e.offset.to_le_bytes());
         out.extend_from_slice(&e.length.to_le_bytes());
         out.extend_from_slice(&e.hash);
@@ -196,7 +213,8 @@ pub fn encode_directory(entries: &[DirectoryEntry]) -> Vec<u8> {
 }
 
 /// Parse a section directory produced by [`encode_directory`], rejecting
-/// truncated input and entry counts whose size would overflow.
+/// truncated input, entry counts whose size would overflow, unknown entry
+/// flags/hash algorithms, and nonzero reserved bytes (all fail-closed).
 pub fn decode_directory(bytes: &[u8]) -> Result<Vec<DirectoryEntry>> {
     let count = le_u32(bytes.get(0..4).context("directory too short")?)? as usize;
     let expected = 4usize
@@ -219,24 +237,37 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<DirectoryEntry>> {
         if !KNOWN_TAGS.contains(&tag) {
             bail!("unknown directory entry tag {tag}");
         }
+        let flags = bytes[pos + 1];
+        if flags & !KNOWN_ENTRY_FLAGS != 0 {
+            bail!("unknown directory entry flags 0x{flags:02x}");
+        }
+        let hash_alg = bytes[pos + 2];
+        if hash_alg != HASH_ALG_SHA256 {
+            bail!("unknown directory entry hash algorithm {hash_alg}");
+        }
+        if bytes[pos + 3] != 0 {
+            bail!("nonzero reserved byte in directory entry");
+        }
         let offset = le_u64(
             bytes
-                .get(pos + 1..pos + 9)
+                .get(pos + 4..pos + 12)
                 .context("directory entry truncated")?,
         )?;
         let length = le_u64(
             bytes
-                .get(pos + 9..pos + 17)
+                .get(pos + 12..pos + 20)
                 .context("directory entry truncated")?,
         )?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(
             bytes
-                .get(pos + 17..pos + 49)
+                .get(pos + 20..pos + 52)
                 .context("directory entry truncated")?,
         );
         entries.push(DirectoryEntry {
             tag,
+            flags,
+            hash_alg,
             offset,
             length,
             hash,

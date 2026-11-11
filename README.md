@@ -125,14 +125,15 @@ access, and enforces the deny-by-default capability policy and fuel limits.
 
 `caf-tool export FILE -o OUTPUT.zip` exports the embedded contents without
 executing a component. It writes `manifest.cbor` (the exact stored bytes),
-`manifest.json`, `interfaces/interface.wit`, numbered `components/0000.wasm`
-files, and the original directory tree under `payload/`, including empty files
-and directories. `export.json` records export format version 2, the original
+`manifest.json`, `interfaces.cbor` plus each WIT source under
+`interfaces/<name>`, numbered `components/0000.wasm` files, and the original
+directory trees under `payloads/<name>/`, including empty files and
+directories. `export.json` records export format version 3, the original
 CAF root hash, whether the source was encrypted, the container format version,
 and component name/path mappings. Signature and keybox sections, when present,
-are retained as `signature.bin` and `keybox.bin`. Entries are deflate-compressed
-by default; `--compression stored` writes them uncompressed for byte-stable
-ZIPs across environments.
+are retained as `signatures.cbor` and `keybox.bin`. Entries are
+deflate-compressed by default; `--compression stored` writes them uncompressed
+for byte-stable ZIPs across environments.
 
 For sealed CAFs, supply `--key HEX` or `--recipient-key HEX`. The stored manifest
 is the public envelope; decrypted private metadata is exported separately as

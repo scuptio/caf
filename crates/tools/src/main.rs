@@ -344,10 +344,10 @@ fn dispatch(command: Command) -> Result<()> {
             if report.signed {
                 let valid = report.signature_valid.unwrap_or(false);
                 println!(
-                    "  signature:     {}",
+                    "  signatures:    {}",
                     if valid { "valid" } else { "INVALID" }
                 );
-                if let Some(fp) = &report.signer_fingerprint {
+                for fp in &report.signer_fingerprints {
                     println!("  signer:        {fp}");
                 }
             } else {
@@ -356,9 +356,9 @@ fn dispatch(command: Command) -> Result<()> {
             if let Some(keys_path) = &trusted_keys {
                 let store = TrustStore::load(keys_path)?;
                 let trusted = report
-                    .signer_fingerprint
-                    .as_deref()
-                    .and_then(|fp| store.keys.get(fp));
+                    .signer_fingerprints
+                    .iter()
+                    .find_map(|fp| store.keys.get(fp));
                 match trusted {
                     Some(publisher) => println!("  trust:         trusted ({publisher})"),
                     None => println!("  trust:         UNTRUSTED signer"),
@@ -421,7 +421,9 @@ fn dispatch(command: Command) -> Result<()> {
                 }
             }
             let mut files = Vec::new();
-            payload::collect_files(&manifest.payloads[0].root, "", &mut files);
+            for p in &manifest.payloads {
+                payload::collect_files(&p.root, "", &mut files);
+            }
             println!("payload files: {}", files.len());
             for (path, hash, len) in &files {
                 println!("  - {path}  {} bytes  {}", len, hash);
@@ -619,10 +621,13 @@ fn inspect_sealed(
         println!("  - {c}");
     }
     println!("components:    {}", envelope.components.len());
-    println!(
-        "payload blob:  {} bytes (padded to {})",
-        envelope.payload.length, envelope.payload.padded_length
-    );
+    println!("payload blobs: {}", envelope.payloads.len());
+    for p in &envelope.payloads {
+        println!(
+            "  - {}: {} bytes (padded to {})",
+            p.name, p.length, p.padded_length
+        );
+    }
     match content_key {
         Some(key) => {
             let private = verify::open_private_manifest(bytes, &key)?;
@@ -641,7 +646,9 @@ fn inspect_sealed(
                 }
             }
             let mut files = Vec::new();
-            payload::collect_files(&private.payloads[0].root, "", &mut files);
+            for p in &private.payloads {
+                payload::collect_files(&p.root, "", &mut files);
+            }
             println!("payload files: {}", files.len());
             for (path, hash, len) in &files {
                 println!("  - {path}  {} bytes  {}", len, hash);

@@ -8,6 +8,7 @@ description = "Shared CAF (Computable Artifact Format) container parsing and ver
 
 [dependencies]
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 ciborium = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }

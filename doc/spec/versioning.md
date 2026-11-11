@@ -32,6 +32,13 @@ change requiring a new `format_version`:
   change — both alter byte identity;
 - a root-hash domain change (identity redefinition).
 
+The 4-byte file magic (`CAF\0`) never changes: it identifies the file *kind*,
+and `format_version` carries the version. The root-hash domain (`CAF1`) is
+different: bump it **only** when the identity semantics change (hash
+algorithm, coverage, or prefix structure), not on every version bump — it is a
+per-version `FormatSpec` field, and `identity::root_hash` must be threaded to
+use `spec().root_domain` once two domains exist.
+
 Conversely: a change no reader can observe (an implementation detail, a
 stricter *writer* rule) needs no bump.
 

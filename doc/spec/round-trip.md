@@ -53,9 +53,9 @@ toolchain)`. The rules:
 mode:
 
 1. Entries are written in a fixed order (`manifest.cbor`, `manifest.json`,
-   `interfaces/interface.wit`, `components/NNNN.wasm` in manifest order,
-   `payload/` tree sorted by path, `signature.bin`, `keybox.bin`,
-   `export.json`).
+   `interfaces.cbor` plus `interfaces/<name>` per WIT source,
+   `components/NNNN.wasm` in manifest order, `payloads/<name>/` trees sorted
+   by path, `signatures.cbor`, `keybox.bin`, `export.json`).
 2. Timestamps are the fixed DOS epoch default; permissions are fixed
    (`0o644` files, `0o755` directories).
 3. Compression is caller-selected: `--compression deflate` (default) or
@@ -63,7 +63,7 @@ mode:
    `flate2`/`Cargo.lock` but may differ across zlib implementations;
    `stored` removes that variable, so ZIP *byte* identity across environments
    additionally requires the zip writer pinned via `Cargo.lock`.
-4. `export.json` carries `export_version` (currently 2), the original
+4. `export.json` carries `export_version` (currently 3), the original
    `root_hash`, `source_encrypted`, `format_version`, `signed`, and the
    component name/path mapping. It is metadata for verification and tooling —
    never an ordering authority.
@@ -82,8 +82,8 @@ mode:
    from the manifest are rejected.
 3. **Reassembly.** The canonical layout (§1 of `container-format.md`) is
    replayed over the verified sections: header (`format_version` from the
-   manifest, `FLAG_SIGNED` iff `signature.bin` is present), manifest,
-   interface, recomputed directory, components, payload files, signature —
+   manifest, `FLAG_SIGNED` iff `signatures.cbor` is present), manifest,
+   interface, recomputed directory, components, payload files, signature list —
    zero padding between sections. Directory payload hashes are the manifest
    tree hashes; the signature entry's hash is zero.
 4. **Verification gates, in order:** per-entry hashes (step 2) → recomputed

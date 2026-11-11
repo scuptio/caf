@@ -1,18 +1,19 @@
 //! Assemble a `.caf` artifact from a build [`Config`]: hash the interface, build
-//! the payload Merkle tree, bind components (access scopes + capability-bound
+//! the payload Merkle trees, bind components (access scopes + capability-bound
 //! exports), compute layout and directory, derive the root hash, and optionally
 //! sign the root hash (Encrypt-then-Sign: the signature always covers the
 //! stored-bytes identity).
 //!
 //! With `[encrypt]` in the config the artifact is **sealed**: components,
-//! payload, and the private manifest are AES-256-GCM encrypted under a content
-//! key wrapped per recipient in the keybox section, the payload becomes a
-//! single pow2-padded ciphertext blob, and the manifest section carries only
-//! the public envelope (see `doc/spec/container-format.md` §7).
+//! payloads, and the private manifest are AES-256-GCM encrypted under a content
+//! key wrapped per recipient in the keybox section, each payload becomes a
+//! pow2-padded ciphertext blob, and the manifest section carries only the
+//! public envelope (see `doc/spec/container-format.md` §7).
 
 use anyhow::{Context, Result, bail};
 use rand_core::RngCore;
 use serde::Serialize;
+use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -61,65 +62,101 @@ pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     }
 }
 
-/// Everything both assembly paths share: interface bytes, payload tree and
+/// Everything both assembly paths share: interface bytes, payload trees and
 /// blobs, component blobs/refs, capabilities.
 struct Prepared {
     interface_bytes: Vec<u8>,
     interface_hash: String,
-    payload_root: PayloadNode,
-    payload_blobs: Vec<Vec<u8>>,
-    file_list: Vec<(String, String, u64)>,
+    payloads: Vec<PreparedPayload>,
     components: Components,
     capabilities: Vec<CapabilityId>,
 }
 
+/// One payload tree with its file blobs in deterministic DFS order.
+struct PreparedPayload {
+    name: String,
+    media_type: String,
+    root_node: PayloadNode,
+    blobs: Vec<Vec<u8>>,
+    file_list: Vec<(String, String, u64)>,
+}
+
 fn prepare(cfg: &Config, base: &Path) -> Result<Prepared> {
-    // 1. Interface (WIT text) and its hash.
-    let interface_sources = load_interfaces(cfg, base)?;
-    let interface_bytes = interface_sources.join("\n").into_bytes();
+    // 1. Interface section: the WIT sources as a name-preserving CBOR list,
+    //    plus a flat parse for validation.
+    let mut interface_files = Vec::new();
+    for path in &cfg.interfaces {
+        let text =
+            std::fs::read_to_string(base.join(path)).with_context(|| format!("read wit {path}"))?;
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("invalid interface file name for {path}"))?
+            .to_string();
+        interface_files.push(InterfaceFile { name, text });
+    }
+    let interface_bytes = if interface_files.is_empty() {
+        Vec::new()
+    } else {
+        cbor_bytes(&interface_files)?
+    };
     let interface_hash = sha256_hex(&interface_bytes);
 
     // 2. Parse/validate the WIT once (when any interface file is declared).
-    let wit = if interface_sources.is_empty() {
+    let wit = if interface_files.is_empty() {
         None
     } else {
-        Some(wit::parse(&interface_sources)?)
+        let sources: Vec<String> = interface_files.iter().map(|f| f.text.clone()).collect();
+        Some(wit::parse(&sources)?)
     };
 
-    // 3. Payload tree (chunked Merkle hashing, over plaintext).
-    let payload_root = payload::build_tree(&base.join(&cfg.payload.root))?;
-    let mut file_list: Vec<(String, String, u64)> = Vec::new();
-    payload::collect_files(&payload_root, "", &mut file_list);
+    // 3. Payload trees (chunked Merkle hashing, over plaintext) and blobs in
+    //    the same deterministic DFS order.
+    let mut payloads = Vec::with_capacity(cfg.payloads.len());
+    for p in &cfg.payloads {
+        let root_node = payload::build_tree(&base.join(&p.root))?;
+        let mut file_list: Vec<(String, String, u64)> = Vec::new();
+        payload::collect_files(&root_node, "", &mut file_list);
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        collect_payload_blobs(&root_node, &base.join(&p.root), Path::new(""), &mut blobs)?;
+        payloads.push(PreparedPayload {
+            name: p.name.clone(),
+            media_type: p.media_type.clone(),
+            root_node,
+            blobs,
+            file_list,
+        });
+    }
+    // Mount rules are build-time fail-closed (unique names, no shadowing of
+    // the default payload's top-level entries).
+    let mount_pairs: Vec<(&str, &PayloadNode)> = payloads
+        .iter()
+        .map(|p| (p.name.as_str(), &p.root_node))
+        .collect();
+    payload::validate_mounts(&mount_pairs)?;
 
     // 4. WASM components: load, optionally embed world metadata, hash, and
     //    build refs with access scopes + capability-bound exports.
-    let components = build_components(cfg, base, &payload_root, &wit)?;
+    let components = build_components(cfg, base, &payloads, &wit)?;
 
-    // 5. Payload blobs in the same deterministic DFS order.
-    let mut payload_blobs: Vec<Vec<u8>> = Vec::new();
-    collect_payload_blobs(
-        &payload_root,
-        &base.join(&cfg.payload.root),
-        Path::new(""),
-        &mut payload_blobs,
-    )?;
-
-    // 6. Capabilities (parsed and deduplicated).
+    // 5. Capabilities (parsed and deduplicated).
     let capabilities = collect_capabilities(cfg)?;
 
     Ok(Prepared {
         interface_bytes,
         interface_hash,
-        payload_root,
-        payload_blobs,
-        file_list,
+        payloads,
         components,
         capabilities,
     })
 }
 
 fn assemble_plaintext(cfg: &Config, p: &Prepared) -> Result<BuildOutput> {
-    let payload_root_hash = p.payload_root.hash.clone();
+    let payload_root_hashes: Vec<String> = p
+        .payloads
+        .iter()
+        .map(|x| x.root_node.hash.clone())
+        .collect();
 
     // Manifest — no absolute offsets (those live in the directory).
     let manifest = Manifest {
@@ -137,28 +174,38 @@ fn assemble_plaintext(cfg: &Config, p: &Prepared) -> Result<BuildOutput> {
         resources: resources(cfg),
         policy: policy(cfg),
         provenance: provenance(cfg),
-        payloads: vec![PayloadRef {
-            root: p.payload_root.clone(),
-            media_type: cfg.payload.media_type.clone(),
-            length: 0,
-            hash: payload_root_hash.clone(),
-            compressed: None,
-            padded_length: None,
-            chunks: Vec::new(),
-        }],
+        payloads: p
+            .payloads
+            .iter()
+            .map(|x| PayloadRef {
+                name: x.name.clone(),
+                root: x.root_node.clone(),
+                media_type: x.media_type.clone(),
+                length: 0,
+                hash: x.root_node.hash.clone(),
+                compressed: None,
+                padded_length: None,
+                chunks: Vec::new(),
+            })
+            .collect(),
         hashes: SectionHashes {
             interface: p.interface_hash.clone(),
             wasm: p.components.hashes.clone(),
-            payload: vec![payload_root_hash.clone()],
+            payload: payload_root_hashes.clone(),
         },
     };
 
     let manifest_bytes = cbor_bytes(&manifest)?;
     let manifest_hash = sha256_hex(&manifest_bytes);
 
-    // Section inventory for layout + directory (deterministic DFS order).
+    // Section inventory for layout + directory (deterministic DFS order,
+    // payload by payload).
     let component_lens: Vec<u64> = p.components.blobs.iter().map(|b| b.len() as u64).collect();
-    let file_lens: Vec<u64> = p.file_list.iter().map(|(_, _, len)| *len).collect();
+    let file_lens: Vec<u64> = p
+        .payloads
+        .iter()
+        .flat_map(|x| x.file_list.iter().map(|(_, _, len)| *len))
+        .collect();
 
     let signed = cfg.sign.is_some();
     let entry_count = 1 + component_lens.len() + file_lens.len() + usize::from(signed);
@@ -177,45 +224,59 @@ fn assemble_plaintext(cfg: &Config, p: &Prepared) -> Result<BuildOutput> {
 
     // Directory (TOC): manifest, components, payload files, signature.
     let mut entries: Vec<DirectoryEntry> = Vec::with_capacity(entry_count);
-    entries.push(DirectoryEntry {
-        tag: TAG_MANIFEST,
-        offset: layout.manifest_offset,
-        length: manifest_bytes.len() as u64,
-        hash: decode_hash(&manifest_hash)?,
-    });
+    entries.push(dir_entry(
+        TAG_MANIFEST,
+        layout.manifest_offset,
+        manifest_bytes.len() as u64,
+        decode_hash(&manifest_hash)?,
+    ));
     for (i, blob) in p.components.blobs.iter().enumerate() {
-        entries.push(DirectoryEntry {
-            tag: TAG_COMPONENT,
-            offset: layout.component_offsets[i],
-            length: blob.len() as u64,
-            hash: decode_hash(&p.components.hashes[i])?,
-        });
+        entries.push(dir_entry(
+            TAG_COMPONENT,
+            layout.component_offsets[i],
+            blob.len() as u64,
+            decode_hash(&p.components.hashes[i])?,
+        ));
     }
-    for (i, (_, hash, len)) in p.file_list.iter().enumerate() {
-        entries.push(DirectoryEntry {
-            tag: TAG_PAYLOAD,
-            offset: layout.file_offsets[i],
-            length: *len,
-            hash: decode_hash(hash)?,
-        });
+    let mut file_index = 0;
+    for payload in &p.payloads {
+        for (_, hash, len) in &payload.file_list {
+            entries.push(dir_entry(
+                TAG_PAYLOAD,
+                layout.file_offsets[file_index],
+                *len,
+                decode_hash(hash)?,
+            ));
+            file_index += 1;
+        }
     }
     if signed {
-        entries.push(DirectoryEntry {
-            tag: TAG_SIGNATURE,
-            offset: layout.signature_offset,
-            length: 96,
-            hash: [0u8; 32],
-        });
+        entries.push(dir_entry(
+            TAG_SIGNATURE,
+            layout.signature_offset,
+            0, // length filled in after the signature is produced
+            [0u8; 32],
+        ));
     }
-    let directory_bytes = layout::encode_directory(&entries);
 
     // Root hash (domain-separated; shared with the verifier).
     let root_hash = caf_core::identity::root_hash(
         &manifest_hash,
         &p.interface_hash,
         &p.components.hashes,
-        &payload_root_hash,
+        &payload_root_hashes,
     )?;
+
+    // Signature section: a CBOR list of signature entries over the root hash.
+    let signature_bytes = match &cfg.sign {
+        Some(_) => Some(sign_root_hash(cfg, &root_hash)?),
+        None => None,
+    };
+    if let Some(bytes) = &signature_bytes {
+        let last = entries.last_mut().context("signature entry")?;
+        last.length = bytes.len() as u64;
+    }
+    let directory_bytes = layout::encode_directory(&entries);
 
     // Write the file.
     let mut out = Vec::new();
@@ -232,16 +293,18 @@ fn assemble_plaintext(cfg: &Config, p: &Prepared) -> Result<BuildOutput> {
         pad_to(&mut out, layout.component_offsets[i]);
         out.extend_from_slice(blob);
     }
-    for (i, data) in p.payload_blobs.iter().enumerate() {
-        pad_to(&mut out, layout.file_offsets[i]);
-        out.extend_from_slice(data);
+    let mut file_index = 0;
+    for payload in &p.payloads {
+        for data in &payload.blobs {
+            pad_to(&mut out, layout.file_offsets[file_index]);
+            out.extend_from_slice(data);
+            file_index += 1;
+        }
     }
 
-    if signed {
+    if let Some(bytes) = &signature_bytes {
         pad_to(&mut out, layout.signature_offset);
-        let (pubkey, sig) = sign_root_hash(cfg, &root_hash)?;
-        out.extend_from_slice(&pubkey);
-        out.extend_from_slice(&sig);
+        out.extend_from_slice(bytes);
     }
 
     Ok(BuildOutput {
@@ -267,17 +330,32 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         None => None,
     };
 
-    // Payload blob: files concatenated in DFS order, pow2-padded with zeros.
-    let mut blob_plain = Vec::new();
-    for data in &p.payload_blobs {
-        blob_plain.extend_from_slice(data);
+    // Per payload: files concatenated in DFS order, pow2-padded with zeros.
+    struct Sealing {
+        blob_plain: Vec<u8>,
+        real_len: u64,
+        padded: u64,
     }
-    let real_len = blob_plain.len() as u64;
-    let padded = crypto::padded_len(real_len);
-    blob_plain.resize(padded as usize, 0);
+    let mut sealings = Vec::with_capacity(p.payloads.len());
+    for payload in &p.payloads {
+        let mut blob_plain = Vec::new();
+        for data in &payload.blobs {
+            blob_plain.extend_from_slice(data);
+        }
+        let real_len = blob_plain.len() as u64;
+        let padded = crypto::padded_len(real_len);
+        blob_plain.resize(padded as usize, 0);
+        sealings.push(Sealing {
+            blob_plain,
+            real_len,
+            padded,
+        });
+    }
 
-    // Private manifest: everything the envelope hides.
-    let mut private = PrivateManifest {
+    // Private manifest: everything the envelope hides. Payload hash/chunks are
+    // plaintext placeholders here; they are replaced with ciphertext refs
+    // after encryption.
+    let private = PrivateManifest {
         name: cfg.name.clone(),
         version: cfg.version.clone(),
         components: p
@@ -293,15 +371,21 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
             })
             .collect(),
         provenance: provenance(cfg),
-        payloads: vec![PayloadRef {
-            root: p.payload_root.clone(),
-            media_type: cfg.payload.media_type.clone(),
-            length: real_len,
-            hash: sha256_hex(&blob_plain),
-            compressed: None,
-            padded_length: Some(padded),
-            chunks: Vec::new(),
-        }],
+        payloads: p
+            .payloads
+            .iter()
+            .zip(&sealings)
+            .map(|(x, s)| PayloadRef {
+                name: x.name.clone(),
+                root: x.root_node.clone(),
+                media_type: x.media_type.clone(),
+                length: s.real_len,
+                hash: sha256_hex(&s.blob_plain),
+                compressed: None,
+                padded_length: Some(s.padded),
+                chunks: Vec::new(),
+            })
+            .collect(),
     };
 
     // Content key: convergent (reproducible) when key_seed is set, else random.
@@ -320,18 +404,29 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         }
     };
 
-    // Encrypt the payload blob per chunk; record ciphertext chunk hashes.
-    let payload_key = crypto::section_key(&content_key, "payload");
-    let chunk_total = payload::chunk_count(padded);
-    let mut blob_ct = Vec::new();
-    let mut blob_chunk_hashes = Vec::with_capacity(chunk_total as usize);
-    for index in 0..chunk_total {
-        let (cs, ce) = payload::chunk_range(padded, index);
-        let ct = crypto::seal_chunk(&payload_key, index, &blob_plain[cs as usize..ce as usize])?;
-        blob_chunk_hashes.push(sha256_hex(&ct));
-        blob_ct.extend_from_slice(&ct);
+    // Encrypt each payload blob per chunk; record ciphertext chunk hashes.
+    let mut private = private;
+    let mut blob_cts = Vec::with_capacity(sealings.len());
+    let mut blob_hashes = Vec::with_capacity(sealings.len());
+    for (i, s) in sealings.iter().enumerate() {
+        let payload_key = crypto::section_key(&content_key, &format!("payload/{i}"));
+        let chunk_total = payload::chunk_count(s.padded);
+        let mut blob_ct = Vec::new();
+        let mut blob_chunk_hashes = Vec::with_capacity(chunk_total as usize);
+        for index in 0..chunk_total {
+            let (cs, ce) = payload::chunk_range(s.padded, index);
+            let ct =
+                crypto::seal_chunk(&payload_key, index, &s.blob_plain[cs as usize..ce as usize])?;
+            blob_chunk_hashes.push(sha256_hex(&ct));
+            blob_ct.extend_from_slice(&ct);
+        }
+        private.payloads[i].chunks = blob_chunk_hashes;
+        blob_hashes.push(sha256_hex(&blob_ct));
+        blob_cts.push(blob_ct);
     }
-    let blob_hash = sha256_hex(&blob_ct);
+    for (i, hash) in blob_hashes.iter().enumerate() {
+        private.payloads[i].hash = hash.clone();
+    }
 
     // Encrypt each component (single chunk per component section).
     let mut component_cts = Vec::with_capacity(p.components.blobs.len());
@@ -343,9 +438,6 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         component_cts.push(ct);
     }
 
-    // Replace the plaintext identity placeholders with stored ciphertext refs.
-    private.payloads[0].hash = blob_hash.clone();
-    private.payloads[0].chunks = blob_chunk_hashes;
     let private_bytes = cbor_bytes(&private)?;
     let private_key = crypto::section_key(&content_key, "private");
     let private_ct = crypto::seal_chunk(&private_key, 0, &private_bytes)?;
@@ -401,74 +493,81 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
             length: keybox_bytes.len() as u64,
             hash: keybox_hash.clone(),
         },
-        payload: PayloadBlobRef {
-            length: blob_ct.len() as u64,
-            padded_length: padded,
-            chunks: chunk_total,
-            hash: blob_hash.clone(),
-        },
+        payloads: blob_cts
+            .iter()
+            .enumerate()
+            .map(|(i, ct)| PayloadBlobRef {
+                name: p.payloads[i].name.clone(),
+                length: ct.len() as u64,
+                padded_length: sealings[i].padded,
+                chunks: payload::chunk_count(sealings[i].padded),
+                hash: blob_hashes[i].clone(),
+            })
+            .collect(),
     };
-    let envelope_bytes = cbor_bytes(&envelope)?;
-    let envelope_hash = sha256_hex(&envelope_bytes);
 
     // Layout + directory: manifest(envelope), interface, directory, keybox,
-    // private, components, payload blob, signature.
+    // private, components, payload blobs, signature.
+    let envelope_bytes = cbor_bytes(&envelope)?;
+    let envelope_hash = sha256_hex(&envelope_bytes);
     let signed = cfg.sign.is_some();
     let component_lens: Vec<u64> = component_cts.iter().map(|c| c.len() as u64).collect();
-    let entry_count = 3 + component_lens.len() + 1 + usize::from(signed);
+    let blob_lens: Vec<u64> = blob_cts.iter().map(|b| b.len() as u64).collect();
+    let entry_count = 3 + component_lens.len() + blob_lens.len() + usize::from(signed);
     let directory_len = 4 + (entry_count * layout::DIRECTORY_ENTRY_SIZE) as u64;
     let layout = layout::compute(
         envelope_bytes.len() as u64,
         p.interface_bytes.len() as u64,
         directory_len,
         &component_lens,
-        &[blob_ct.len() as u64],
+        &blob_lens,
         signed,
         Some((keybox_bytes.len() as u64, private_ct.len() as u64)),
     );
 
     let mut entries: Vec<DirectoryEntry> = Vec::with_capacity(entry_count);
-    entries.push(DirectoryEntry {
-        tag: TAG_MANIFEST,
-        offset: layout.manifest_offset,
-        length: envelope_bytes.len() as u64,
-        hash: decode_hash(&envelope_hash)?,
-    });
-    entries.push(DirectoryEntry {
-        tag: TAG_KEYBOX,
-        offset: layout.keybox_offset,
-        length: keybox_bytes.len() as u64,
-        hash: decode_hash(&keybox_hash)?,
-    });
-    entries.push(DirectoryEntry {
-        tag: TAG_PRIVATE,
-        offset: layout.private_offset,
-        length: private_ct.len() as u64,
-        hash: decode_hash(&sha256_hex(&private_ct))?,
-    });
+    entries.push(dir_entry(
+        TAG_MANIFEST,
+        layout.manifest_offset,
+        envelope_bytes.len() as u64,
+        decode_hash(&envelope_hash)?,
+    ));
+    entries.push(dir_entry(
+        TAG_KEYBOX,
+        layout.keybox_offset,
+        keybox_bytes.len() as u64,
+        decode_hash(&keybox_hash)?,
+    ));
+    entries.push(dir_entry(
+        TAG_PRIVATE,
+        layout.private_offset,
+        private_ct.len() as u64,
+        decode_hash(&sha256_hex(&private_ct))?,
+    ));
     for (i, ct) in component_cts.iter().enumerate() {
-        entries.push(DirectoryEntry {
-            tag: TAG_COMPONENT,
-            offset: layout.component_offsets[i],
-            length: ct.len() as u64,
-            hash: decode_hash(&component_ct_hashes[i])?,
-        });
+        entries.push(dir_entry(
+            TAG_COMPONENT,
+            layout.component_offsets[i],
+            ct.len() as u64,
+            decode_hash(&component_ct_hashes[i])?,
+        ));
     }
-    entries.push(DirectoryEntry {
-        tag: TAG_PAYLOAD,
-        offset: layout.file_offsets[0],
-        length: blob_ct.len() as u64,
-        hash: decode_hash(&blob_hash)?,
-    });
+    for (i, ct) in blob_cts.iter().enumerate() {
+        entries.push(dir_entry(
+            TAG_PAYLOAD,
+            layout.file_offsets[i],
+            ct.len() as u64,
+            decode_hash(&blob_hashes[i])?,
+        ));
+    }
     if signed {
-        entries.push(DirectoryEntry {
-            tag: TAG_SIGNATURE,
-            offset: layout.signature_offset,
-            length: 96,
-            hash: [0u8; 32],
-        });
+        entries.push(dir_entry(
+            TAG_SIGNATURE,
+            layout.signature_offset,
+            0,
+            [0u8; 32],
+        ));
     }
-    let directory_bytes = layout::encode_directory(&entries);
 
     // Root hash over the stored (ciphertext) sections; the envelope hash
     // transitively covers keybox and private manifest.
@@ -476,8 +575,18 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         &envelope_hash,
         &p.interface_hash,
         &component_ct_hashes,
-        &blob_hash,
+        &blob_hashes,
     )?;
+
+    let signature_bytes = match &cfg.sign {
+        Some(_) => Some(sign_root_hash(cfg, &root_hash)?),
+        None => None,
+    };
+    if let Some(bytes) = &signature_bytes {
+        let last = entries.last_mut().context("signature entry")?;
+        last.length = bytes.len() as u64;
+    }
+    let directory_bytes = layout::encode_directory(&entries);
 
     let mut out = Vec::new();
     let mut flags = FLAG_ENCRYPTED;
@@ -499,14 +608,14 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         pad_to(&mut out, layout.component_offsets[i]);
         out.extend_from_slice(ct);
     }
-    pad_to(&mut out, layout.file_offsets[0]);
-    out.extend_from_slice(&blob_ct);
+    for (i, ct) in blob_cts.iter().enumerate() {
+        pad_to(&mut out, layout.file_offsets[i]);
+        out.extend_from_slice(ct);
+    }
 
-    if signed {
+    if let Some(bytes) = &signature_bytes {
         pad_to(&mut out, layout.signature_offset);
-        let (pubkey, sig) = sign_root_hash(cfg, &root_hash)?;
-        out.extend_from_slice(&pubkey);
-        out.extend_from_slice(&sig);
+        out.extend_from_slice(bytes);
     }
 
     // The plaintext-shaped full manifest, for `--dump-manifest` records.
@@ -525,7 +634,7 @@ fn assemble_sealed(cfg: &Config, p: &Prepared, encrypt: &EncryptConfig) -> Resul
         hashes: SectionHashes {
             interface: p.interface_hash.clone(),
             wasm: p.components.hashes.clone(),
-            payload: vec![blob_hash],
+            payload: blob_hashes,
         },
     };
 
@@ -601,13 +710,6 @@ fn collect_capabilities(cfg: &Config) -> Result<Vec<CapabilityId>> {
     Ok(out)
 }
 
-fn load_interfaces(cfg: &Config, base: &Path) -> Result<Vec<String>> {
-    cfg.interfaces
-        .iter()
-        .map(|p| std::fs::read_to_string(base.join(p)).with_context(|| format!("read wit {p}")))
-        .collect()
-}
-
 struct Components {
     blobs: Vec<Vec<u8>>,
     hashes: Vec<String>,
@@ -617,7 +719,7 @@ struct Components {
 fn build_components(
     cfg: &Config,
     base: &Path,
-    payload_root: &PayloadNode,
+    payloads: &[PreparedPayload],
     wit: &Option<wit::Wit>,
 ) -> Result<Components> {
     let mut out = Components {
@@ -674,10 +776,25 @@ fn build_components(
 
         let mut access = Vec::with_capacity(c.access.len());
         for a in &c.access {
-            let node = payload::find(payload_root, a)
-                .with_context(|| format!("access path '{a}' not found in payload"))?;
+            let (payload_name, path) = parse_access(a)?;
+            let payload_name = if payload_name.is_empty() {
+                payloads
+                    .first()
+                    .context("access scope on a build without payloads")?
+                    .name
+                    .clone()
+            } else {
+                payload_name
+            };
+            let tree = payloads
+                .iter()
+                .find(|p| p.name == payload_name)
+                .with_context(|| format!("access scope '{a}': unknown payload '{payload_name}'"))?;
+            let node = payload::find(&tree.root_node, &path)
+                .with_context(|| format!("access path '{path}' not found in payload"))?;
             access.push(AccessScope {
-                path: a.clone(),
+                payload: payload_name,
+                path,
                 hash: node.hash.clone(),
                 mode: AccessMode::Read,
             });
@@ -696,6 +813,21 @@ fn build_components(
     }
 
     Ok(out)
+}
+
+/// Parse an access string: `/path` addresses the default (first) payload,
+/// `name:/path` addresses a named payload.
+fn parse_access(access: &str) -> Result<(String, String)> {
+    if access.starts_with('/') {
+        return Ok((String::new(), access.to_string()));
+    }
+    let (name, path) = access
+        .split_once(':')
+        .with_context(|| format!("invalid access scope '{access}'"))?;
+    if name.is_empty() || !path.starts_with('/') {
+        bail!("invalid access scope '{access}'");
+    }
+    Ok((name.to_string(), path.to_string()))
 }
 
 /// Every capability recorded in the manifest must be callable with its
@@ -782,8 +914,9 @@ fn collect_payload_blobs(
 }
 
 /// Sign the artifact root hash (Encrypt-then-Sign: the signature covers the
-/// stored-bytes identity — ciphertext for sealed artifacts).
-fn sign_root_hash(cfg: &Config, root_hash: &[u8; 32]) -> Result<([u8; 32], [u8; 64])> {
+/// stored-bytes identity — ciphertext for sealed artifacts). The section is a
+/// CBOR list so co-signing is just another entry.
+fn sign_root_hash(cfg: &Config, root_hash: &[u8; 32]) -> Result<Vec<u8>> {
     use ed25519_dalek::{Signer, SigningKey};
 
     let seed_hex = cfg
@@ -795,7 +928,13 @@ fn sign_root_hash(cfg: &Config, root_hash: &[u8; 32]) -> Result<([u8; 32], [u8; 
     let signing_key = SigningKey::from_bytes(&seed);
     let pubkey = signing_key.verifying_key().to_bytes();
     let sig = signing_key.sign(root_hash);
-    Ok((pubkey, sig.to_bytes()))
+    let entry = SignatureEntry {
+        alg: SignatureAlgorithm::Ed25519,
+        key_id: payload::signer_fingerprint(&pubkey),
+        pubkey: ByteBuf::from(pubkey.to_vec()),
+        sig: ByteBuf::from(sig.to_bytes().to_vec()),
+    };
+    cbor_bytes(&vec![entry])
 }
 
 fn decode_seed(what: &str, seed_hex: &str) -> Result<[u8; 32]> {
@@ -803,6 +942,17 @@ fn decode_seed(what: &str, seed_hex: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("{what} must be 32 bytes (64 hex chars)"))
+}
+
+fn dir_entry(tag: u8, offset: u64, length: u64, hash: [u8; 32]) -> DirectoryEntry {
+    DirectoryEntry {
+        tag,
+        flags: 0,
+        hash_alg: layout::HASH_ALG_SHA256,
+        offset,
+        length,
+        hash,
+    }
 }
 
 fn cbor_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {

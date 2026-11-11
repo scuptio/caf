@@ -292,13 +292,18 @@ function decodeDirectory(bytes) {
   for (let i = 0; i < count; i++) {
     const tag = bytes[pos];
     if (!KNOWN_TAGS.has(tag)) throw new Error(`unknown directory entry tag ${tag}`);
+    const flags = bytes[pos + 1];
+    if (flags !== 0) throw new Error(`unknown directory entry flags 0x${flags.toString(16)}`);
+    const hashAlg = bytes[pos + 2];
+    if (hashAlg !== 0) throw new Error(`unknown directory entry hash algorithm ${hashAlg}`);
+    if (bytes[pos + 3] !== 0) throw new Error("nonzero reserved byte in directory entry");
     entries.push({
       tag,
-      offset: leU64(dv, pos + 1),
-      length: leU64(dv, pos + 9),
-      hash: toHex(bytes.slice(pos + 17, pos + 49)),
+      offset: leU64(dv, pos + 4),
+      length: leU64(dv, pos + 12),
+      hash: toHex(bytes.slice(pos + 20, pos + 52)),
     });
-    pos += 49;
+    pos += 52;
   }
   return entries;
 }
@@ -337,16 +342,52 @@ function findNode(root, path) {
 }
 
 // RootHash = SHA256("CAF1" || u64le(len)||ManifestHash || u64le(len)||InterfaceHash
-//                   || u64le(n)||(u64le(len)||WasmHash)* || u64le(len)||PayloadRootHash)
-function computeRootHash(manifestHashHex, interfaceHashHex, wasmHashesHex, payloadRootHex) {
+//                   || u64le(n)||(u64le(len)||WasmHash)*
+//                   || u64le(m)||(u64le(len)||PayloadRootHash)*)
+function computeRootHash(manifestHashHex, interfaceHashHex, wasmHashesHex, payloadRootsHex) {
   const parts = [utf8enc.encode("CAF1")];
   const push = (hex) => { const raw = hexToBytes(hex); parts.push(u64le(raw.length), raw); };
   push(manifestHashHex);
   push(interfaceHashHex);
   parts.push(u64le(wasmHashesHex.length));
   for (const h of wasmHashesHex) push(h);
-  push(payloadRootHex);
+  parts.push(u64le(payloadRootsHex.length));
+  for (const h of payloadRootsHex) push(h);
   return toHex(sha256Sync(concatBytes(parts)));
+}
+
+// Multi-payload mount rules (mirrors caf-core::payload::validate_payloads):
+// unique, safe names; the first payload mounts at "/", others at "/<name>/",
+// so a named payload must not shadow a top-level entry of the default one.
+function validatePayloads(payloads) {
+  const names = new Set();
+  for (const p of payloads) {
+    const name = p.name || "";
+    if (name === "" || name === "." || name === ".." || name.includes("/") || name.includes("\\")) {
+      throw new Error(`invalid payload name '${name}'`);
+    }
+    if (names.has(name)) throw new Error(`duplicate payload name '${name}'`);
+    names.add(name);
+  }
+  if (payloads.length > 0) {
+    for (const entry of payloads[0].root.entries || []) {
+      if ([...names].slice(1).includes(entry.name)) {
+        throw new Error(`payload name '${entry.name}' collides with a top-level entry of the default payload`);
+      }
+    }
+  }
+}
+
+// The default payload keeps tree-relative paths; other payloads are prefixed
+// with their name. "" or the first payload's name selects the default.
+function resolvePayloadIndex(payloads, name) {
+  if (!name || name === payloads[0]?.name) return 0;
+  const idx = payloads.findIndex((p) => p.name === name);
+  return idx === -1 ? null : idx;
+}
+
+function mountPath(index, name, treePath) {
+  return index === 0 ? treePath : `/${name}${treePath}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,9 +425,9 @@ async function openChunk(sectionKeyBytes, index, ciphertext) {
 
 export class Artifact {
   #source;
-  #files = new Map(); // path -> { offset, length, node }
+  #files = new Map(); // mounted path -> { offset, length, node, payload, treePath }
   #verifiedChunks = new Set(); // absolute chunk start offsets already verified
-  #sealed = null; // { blob, starts: Map<path, start> } — decrypted at open
+  #sealed = null; // { blobs: [Uint8Array, ...] } — decrypted at open
 
   constructor(source, header, manifest, directory, components, signature, sealed = null) {
     this.#source = source;
@@ -394,17 +435,21 @@ export class Artifact {
     this.manifest = manifest;
     this.directory = directory;
     this.components = components; // [{ ref, bytes, entry }]
-    this.signature = signature; // { fingerprint, valid } | null
+    this.signature = signature; // { fingerprint, valid, signers } | null
     this.#sealed = sealed;
-    const fileList = collectFiles(manifest.payloads[0].root, "", []);
+    // Mounted file list: default payload at "/", others at "/<name>/".
+    const fileList = [];
+    (manifest.payloads || []).forEach((p, i) => {
+      for (const f of collectFiles(p.root, "", [])) {
+        fileList.push({ mounted: mountPath(i, p.name, f.path), treePath: f.path, node: f.node, payload: i });
+      }
+    });
     if (sealed) {
-      // Sealed artifact: files map into the decrypted in-memory blob; every
+      // Sealed artifact: files map into the decrypted in-memory blobs; every
       // ciphertext chunk was hash-verified and AEAD-opened at open time.
-      let at = 0;
       for (const f of fileList) {
-        sealed.starts.set(f.path, at);
-        this.#files.set(f.path, { offset: at, length: f.node.length, node: f.node });
-        at += f.node.length;
+        const start = sealed.starts[f.payload].get(f.treePath);
+        this.#files.set(f.mounted, { offset: start, length: f.node.length, node: f.node, payload: f.payload, treePath: f.treePath });
       }
       return;
     }
@@ -413,7 +458,7 @@ export class Artifact {
       throw new Error("payload directory/file count mismatch");
     }
     fileList.forEach((f, i) => {
-      this.#files.set(f.path, { offset: payloadEntries[i].offset, length: payloadEntries[i].length, node: f.node });
+      this.#files.set(f.mounted, { offset: payloadEntries[i].offset, length: payloadEntries[i].length, node: f.node, payload: f.payload, treePath: f.treePath });
     });
   }
 
@@ -438,8 +483,7 @@ export class Artifact {
     if (pos + len > meta.length) throw new Error("payload range out of bounds");
     if (len === 0) return new Uint8Array(0);
     if (this.#sealed) {
-      const start = this.#sealed.starts.get(path);
-      return this.#sealed.blob.slice(start + pos, start + pos + len);
+      return this.#sealed.blobs[meta.payload].slice(meta.offset + pos, meta.offset + pos + len);
     }
     const node = meta.node;
     if ((node.chunks || []).length <= 1) {
@@ -467,8 +511,7 @@ export class Artifact {
     if (pos + len > meta.length) throw new Error("payload range out of bounds");
     if (len === 0) return new Uint8Array(0);
     if (this.#sealed) {
-      const start = this.#sealed.starts.get(path);
-      return this.#sealed.blob.slice(start + pos, start + pos + len);
+      return this.#sealed.blobs[meta.payload].slice(meta.offset + pos, meta.offset + pos + len);
     }
     const node = meta.node;
     if ((node.chunks || []).length <= 1) {
@@ -559,13 +602,19 @@ class ComponentHandle {
     const memory8 = () => new Uint8Array(memory.buffer);
     const readGuestStr = (ptr, len) => utf8.decode(memory8().slice(ptr, ptr + len));
 
-    // payload-fs over the artifact's access-scoped file set.
-    const scope = comp.ref.access || [];
+    // payload-fs over the artifact's access-scoped file set. Scopes are
+    // tree-relative with a payload name; guests address mounted paths.
+    const payloads = artifact.manifest.payloads || [];
+    const scope = (comp.ref.access || []).map((s) => {
+      const idx = resolvePayloadIndex(payloads, s.payload || "");
+      if (idx === null) throw new Error(`access scope '${s.path}': unknown payload '${s.payload}'`);
+      return idx === 0 ? s.path : `/${payloads[idx].name}${s.path}`;
+    });
     const visible = (path) => {
       if (scope.length === 0) return false;
-      return scope.some((s) => {
-        const sp = s.path.replace(/\/+$/, "");
-        return sp === "" || path === sp || path.startsWith(sp + "/");
+      return scope.some((sp) => {
+        const p = sp.replace(/\/+$/, "");
+        return p === "" || path === p || path.startsWith(p + "/");
       });
     };
 
@@ -789,17 +838,19 @@ export async function openCaf(input, { fetchMode = "auto", contentKey = null } =
     throw new Error("interface hash mismatch");
   }
 
-  if (!manifest.payloads || manifest.payloads.length !== 1) {
-    throw new Error("expected exactly one payload tree");
+  if (!manifest.payloads) throw new Error("manifest has no payloads");
+  validatePayloads(manifest.payloads);
+  for (const p of manifest.payloads) {
+    if (p.compressed) {
+      throw new Error("payload compression is reserved in format v1 (not yet implemented)");
+    }
+    verifyTree(p.root);
   }
-  if (manifest.payloads[0].compressed) {
-    throw new Error("payload compression is reserved in format v1 (not yet implemented)");
-  }
-  const payloadRoot = manifest.payloads[0].root;
-  verifyTree(payloadRoot);
   for (const comp of manifest.components || []) {
     for (const scope of comp.access || []) {
-      const node = findNode(payloadRoot, scope.path);
+      const idx = resolvePayloadIndex(manifest.payloads, scope.payload || "");
+      if (idx === null) throw new Error(`access scope '${scope.path}': unknown payload '${scope.payload}'`);
+      const node = findNode(manifest.payloads[idx].root, scope.path);
       if (!node) throw new Error(`access scope '${scope.path}' not found`);
       if (node.hash !== scope.hash) throw new Error(`access scope '${scope.path}' hash mismatch`);
     }
@@ -823,7 +874,8 @@ export async function openCaf(input, { fetchMode = "auto", contentKey = null } =
   }
 
   // 4. Root identity.
-  const rootHash = computeRootHash(manifestHash, interfaceHash, wasmHashes, payloadRoot.hash);
+  const payloadRoots = (manifest.payloads || []).map((p) => p.root.hash);
+  const rootHash = computeRootHash(manifestHash, interfaceHash, wasmHashes, payloadRoots);
   if (rootHash !== header.rootHash) throw new Error("root hash mismatch");
 
   // 5. Signature over the root hash (best-effort: needs WebCrypto Ed25519).
@@ -833,19 +885,29 @@ export async function openCaf(input, { fetchMode = "auto", contentKey = null } =
   return artifact;
 }
 
-// The ed25519 signature covers the 32-byte header root hash — the identity of
-// the stored bytes (ciphertext for sealed artifacts: Encrypt-then-Sign).
+// The signature section is a CBOR list of { alg, key_id, pubkey, sig } entries
+// over the 32-byte header root hash — the identity of the stored bytes
+// (ciphertext for sealed artifacts: Encrypt-then-Sign). Every entry must
+// verify; unknown algorithms are a hard error (fail-closed).
 async function readSignature(source, header, directory, rootHash) {
   if (!(header.flags & FLAG_SIGNED)) return null;
   const sigEntry = directory.find((e) => e.tag === TAG_SIGNATURE);
   if (!sigEntry) throw new Error("signed artifact has no signature directory entry");
   const sigBytes = await source.readAt(sigEntry.offset, sigEntry.length);
-  if (sigBytes.length !== 96) throw new Error("signature section has unexpected length");
-  const pubkey = sigBytes.slice(0, 32);
-  const sig = sigBytes.slice(32, 96);
-  const signature = { fingerprint: sha256Hex(pubkey), valid: await tryVerifyEd25519(pubkey, sig, hexToBytes(rootHash)) };
-  if (signature.valid === false) throw new Error("invalid signature");
-  return signature;
+  const list = decodeCBOR(sigBytes, 0).value;
+  if (!Array.isArray(list) || list.length === 0) throw new Error("signature section is empty");
+  const signers = [];
+  let valid = true;
+  for (const entry of list) {
+    if (entry.alg !== "ed25519") throw new Error(`unknown signature algorithm ${entry.alg}`);
+    const fingerprint = sha256Hex(entry.pubkey);
+    if (entry.key_id !== fingerprint) throw new Error("signature key_id does not match its public key");
+    const v = await tryVerifyEd25519(entry.pubkey, entry.sig, hexToBytes(rootHash));
+    if (v === false) throw new Error("invalid signature");
+    signers.push({ fingerprint, valid: v });
+    if (v !== true) valid = v; // null = unverifiable platform
+  }
+  return { fingerprint: signers[0].fingerprint, valid, signers };
 }
 
 // Open a sealed artifact: verify the ciphertext hash chain, decrypt the
@@ -883,12 +945,17 @@ async function openSealed(source, header, directory, envelopeBytes, envelopeHash
   if (sha256Hex(privateCt) !== envelope.private.hash) throw new Error("private manifest hash mismatch");
   const privatePlain = await openChunk(sectionKey(contentKey, "private"), 0, privateCt);
   const priv = decodeCBOR(privatePlain, 0).value;
-  if (!priv.payloads || priv.payloads.length !== 1) throw new Error("expected exactly one payload tree");
-  const payloadRef = priv.payloads[0];
-  verifyTree(payloadRef.root);
+  if (!priv.payloads) throw new Error("private manifest has no payloads");
+  validatePayloads(priv.payloads);
+  if (priv.payloads.length !== (envelope.payloads || []).length) {
+    throw new Error("private/envelope payload count mismatch");
+  }
+  for (const payloadRef of priv.payloads) verifyTree(payloadRef.root);
   for (const comp of priv.components || []) {
     for (const scope of comp.access || []) {
-      const node = findNode(payloadRef.root, scope.path);
+      const idx = resolvePayloadIndex(priv.payloads, scope.payload || "");
+      if (idx === null) throw new Error(`access scope '${scope.path}': unknown payload '${scope.payload}'`);
+      const node = findNode(priv.payloads[idx].root, scope.path);
       if (!node) throw new Error(`access scope '${scope.path}' not found`);
       if (node.hash !== scope.hash) throw new Error(`access scope '${scope.path}' hash mismatch`);
     }
@@ -912,29 +979,43 @@ async function openSealed(source, header, directory, envelopeBytes, envelopeHash
     components.push({ ref: { ...ref, length: plain.length }, bytes: plain, entry });
   }
 
-  // Payload blob: verify the ciphertext hash, then decrypt per chunk.
+  // Payload blobs: verify each ciphertext hash, then decrypt per chunk.
   const blobEntries = directory.filter((e) => e.tag === TAG_PAYLOAD);
-  if (blobEntries.length !== 1) throw new Error("sealed artifact must carry exactly one payload blob");
-  const blobEntry = blobEntries[0];
-  const blob = await source.readAt(blobEntry.offset, blobEntry.length);
-  const blobHash = sha256Hex(blob);
-  if (blobHash !== envelope.payload.hash || blobHash !== blobEntry.hash) throw new Error("payload blob hash mismatch");
-  const paddedLength = Number(envelope.payload.padded_length);
-  const chunkCount = Math.ceil(paddedLength / CHUNK_SIZE);
-  if (chunkCount !== envelope.payload.chunks) throw new Error("payload chunk count mismatch");
-  const payloadKey = sectionKey(contentKey, "payload");
-  const plainParts = [];
-  for (let i = 0; i < chunkCount; i++) {
-    const cs = i * CHUNK_SIZE;
-    const ce = Math.min(cs + CHUNK_SIZE, paddedLength);
-    const ctOff = i * (CHUNK_SIZE + AEAD_TAG_LEN);
-    const ct = blob.slice(ctOff, ctOff + (ce - cs) + AEAD_TAG_LEN);
-    if (sha256Hex(ct) !== payloadRef.chunks[i]) throw new Error(`payload chunk ${i} ciphertext hash mismatch`);
-    plainParts.push(await openChunk(payloadKey, i, ct));
+  if (blobEntries.length !== envelope.payloads.length) throw new Error("payload blob count mismatch");
+  const blobs = [];
+  const starts = [];
+  const blobHashes = [];
+  for (let i = 0; i < envelope.payloads.length; i++) {
+    const blobRef = envelope.payloads[i];
+    const payloadRef = priv.payloads[i];
+    if (payloadRef.name !== blobRef.name) throw new Error(`private/envelope payload name mismatch at index ${i}`);
+    const blobEntry = blobEntries[i];
+    const blob = await source.readAt(blobEntry.offset, blobEntry.length);
+    const blobHash = sha256Hex(blob);
+    if (blobHash !== blobRef.hash || blobHash !== blobEntry.hash) throw new Error(`payload blob '${blobRef.name}' hash mismatch`);
+    const paddedLength = Number(blobRef.padded_length);
+    const chunkCount = Math.ceil(paddedLength / CHUNK_SIZE);
+    if (chunkCount !== blobRef.chunks) throw new Error("payload chunk count mismatch");
+    const payloadKey = sectionKey(contentKey, `payload/${i}`);
+    const plainParts = [];
+    for (let c = 0; c < chunkCount; c++) {
+      const cs = c * CHUNK_SIZE;
+      const ce = Math.min(cs + CHUNK_SIZE, paddedLength);
+      const ctOff = c * (CHUNK_SIZE + AEAD_TAG_LEN);
+      const ct = blob.slice(ctOff, ctOff + (ce - cs) + AEAD_TAG_LEN);
+      if (sha256Hex(ct) !== payloadRef.chunks[c]) throw new Error(`payload chunk ${c} ciphertext hash mismatch`);
+      plainParts.push(await openChunk(payloadKey, c, ct));
+    }
+    const map = new Map();
+    let at = 0;
+    for (const f of collectFiles(payloadRef.root, "", [])) { map.set(f.path, at); at += f.node.length; }
+    blobs.push(concatBytes(plainParts));
+    starts.push(map);
+    blobHashes.push(blobHash);
   }
 
   // Root identity over the stored (ciphertext) sections, then the signature.
-  const rootHash = computeRootHash(envelopeHash, interfaceHash, wasmHashes, blobHash);
+  const rootHash = computeRootHash(envelopeHash, interfaceHash, wasmHashes, blobHashes);
   if (rootHash !== header.rootHash) throw new Error("root hash mismatch");
   const signature = await readSignature(source, header, directory, rootHash);
 
@@ -951,9 +1032,9 @@ async function openSealed(source, header, directory, envelopeBytes, envelopeHash
     policy: envelope.policy,
     provenance: priv.provenance,
     payloads: priv.payloads,
-    hashes: { interface: interfaceHash, wasm: wasmHashes, payload: [blobHash] },
+    hashes: { interface: interfaceHash, wasm: wasmHashes, payload: blobHashes },
   };
-  const sealed = { blob: concatBytes(plainParts), starts: new Map() };
+  const sealed = { blobs, starts };
   return new Artifact(source, header, manifest, directory, components, signature, sealed);
 }
 

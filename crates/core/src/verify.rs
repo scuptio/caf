@@ -43,12 +43,12 @@ pub struct VerifyReport {
     pub encrypted: bool,
     /// Whether the artifact carries a signature section.
     pub signed: bool,
-    /// Signature validity (`None` when the artifact is unsigned). The signature
-    /// covers the header root hash — Encrypt-then-Sign for sealed artifacts.
+    /// Signature validity (`None` when the artifact is unsigned): every
+    /// signature entry verified against the header root hash.
     pub signature_valid: Option<bool>,
-    /// SHA-256 of the embedded ed25519 public key — the signer's fingerprint,
-    /// for comparison against an external trust store.
-    pub signer_fingerprint: Option<String>,
+    /// Signer fingerprints — one per signature entry (SHA-256 of each public
+    /// key, hex), for comparison against an external trust store.
+    pub signer_fingerprints: Vec<String>,
 }
 
 /// Open-time verification: recompute every section hash, the manifest hash, the
@@ -88,7 +88,9 @@ pub fn verify_bytes_keyed(bytes: &[u8], content_key: Option<&[u8; 32]>) -> Resul
         verify_plaintext(bytes, &header, &entries)?
     };
 
-    // Signature (both modes): an ed25519 signature over the header root hash.
+    // Signature (both modes): a CBOR list of signatures over the header root
+    // hash (Encrypt-then-Sign for sealed artifacts). Every entry must carry an
+    // honest key_id and a signature that verifies.
     report.signed = header.flags & layout::FLAG_SIGNED != 0;
     if report.signed {
         let sig_entry = entries
@@ -96,18 +98,24 @@ pub fn verify_bytes_keyed(bytes: &[u8], content_key: Option<&[u8; 32]>) -> Resul
             .find(|e| e.tag == TAG_SIGNATURE)
             .context("signed artifact has no signature directory entry")?;
         let sig_bytes = layout::slice(bytes, sig_entry.offset, sig_entry.length)?;
-        if sig_bytes.len() != 96 {
-            bail!(
-                "signature section has unexpected length {}",
-                sig_bytes.len()
-            );
+        let signatures: Vec<SignatureEntry> =
+            ciborium::de::from_reader(sig_bytes).context("decode signature section")?;
+        let mut all_valid = !signatures.is_empty();
+        for entry in &signatures {
+            let valid = match entry.alg {
+                SignatureAlgorithm::Ed25519 => {
+                    entry.key_id == payload::signer_fingerprint(entry.pubkey.as_ref())
+                        && payload::verify_signature(
+                            entry.pubkey.as_ref(),
+                            entry.sig.as_ref(),
+                            &header.root_hash,
+                        )
+                }
+            };
+            all_valid &= valid;
+            report.signer_fingerprints.push(entry.key_id.clone());
         }
-        report.signer_fingerprint = Some(payload::signer_fingerprint(&sig_bytes[..32]));
-        report.signature_valid = Some(payload::verify_signature(
-            &sig_bytes[..32],
-            &sig_bytes[32..],
-            &header.root_hash,
-        ));
+        report.signature_valid = Some(all_valid);
     }
     Ok(report)
 }
@@ -173,51 +181,59 @@ fn verify_plaintext(
         wasm_hashes.push(h);
     }
 
-    // 4. Payload: file chunk-Merkle hashes + tree structure + access scopes.
-    //    This format version carries exactly one payload tree.
-    if manifest.payloads.len() != 1 {
-        bail!(
-            "expected exactly one payload tree, got {}",
-            manifest.payloads.len()
-        );
-    }
-    let payload_root = &manifest.payloads[0].root;
-    let mut file_list: Vec<(String, String, u64)> = Vec::new();
-    payload::collect_files(payload_root, "", &mut file_list);
-
+    // 4. Payloads: file chunk-Merkle hashes + tree structure, in manifest
+    //    order. Directory payload entries are ordered payload by payload.
     let payload_entries: Vec<_> = entries.iter().filter(|e| e.tag == TAG_PAYLOAD).collect();
-    if payload_entries.len() != file_list.len() {
+    let total_files: usize = manifest
+        .payloads
+        .iter()
+        .map(|p| {
+            let mut files = Vec::new();
+            payload::collect_files(&p.root, "", &mut files);
+            files.len()
+        })
+        .sum();
+    if payload_entries.len() != total_files {
         bail!(
-            "payload file count mismatch: directory {}, tree {}",
+            "payload file count mismatch: directory {}, trees {}",
             payload_entries.len(),
-            file_list.len()
+            total_files
         );
     }
-    for (i, (path, expected_hash, _len)) in file_list.iter().enumerate() {
-        let e = payload_entries[i];
-        let data = layout::slice(bytes, e.offset, e.length)?;
-        let h = payload::verify_file(data)?;
-        if &h != expected_hash {
-            bail!("payload '{path}' hash mismatch");
+    let mut payload_root_hashes = Vec::with_capacity(manifest.payloads.len());
+    let mut next_entry = 0;
+    for payload_ref in &manifest.payloads {
+        let mut file_list: Vec<(String, String, u64)> = Vec::new();
+        payload::collect_files(&payload_ref.root, "", &mut file_list);
+        for (path, expected_hash, _len) in &file_list {
+            let e = payload_entries[next_entry];
+            next_entry += 1;
+            let data = layout::slice(bytes, e.offset, e.length)?;
+            let h = payload::verify_file(data)?;
+            if &h != expected_hash {
+                bail!("payload '{path}' hash mismatch");
+            }
+            if e.hash != decode_hash(&h)? {
+                bail!("payload '{path}' directory hash mismatch");
+            }
         }
-        if e.hash != decode_hash(&h)? {
-            bail!("payload '{path}' directory hash mismatch");
-        }
+        payload::verify_tree(&payload_ref.root)?;
+        payload_root_hashes.push(payload_ref.root.hash.clone());
     }
-    payload::verify_tree(payload_root)?;
-    if manifest.hashes.payload.len() != 1 || manifest.hashes.payload[0] != payload_root.hash {
+    payload::validate_payloads(&manifest.payloads)?;
+    if manifest.hashes.payload != payload_root_hashes {
         bail!("payload root hash mismatch");
     }
 
     // 5. Access scopes must resolve to real, hash-matching nodes.
-    check_access_scopes(&manifest.components, payload_root)?;
+    check_access_scopes(&manifest.components, &manifest.payloads)?;
 
     // 6. Root hash (domain-separated, shared with the builder).
     let root_hash = identity::root_hash(
         &manifest_hash,
         &interface_hash,
         &wasm_hashes,
-        &payload_root.hash,
+        &payload_root_hashes,
     )?;
     if root_hash != header.root_hash {
         bail!("root hash mismatch");
@@ -229,12 +245,12 @@ fn verify_plaintext(
         root_hash: hex::encode(&root_hash),
         manifest_hash,
         components: manifest.components.len(),
-        payload_files: file_list.len(),
+        payload_files: total_files,
         capabilities: manifest.capabilities.clone(),
         encrypted: false,
         signed: false,
         signature_valid: None,
-        signer_fingerprint: None,
+        signer_fingerprints: Vec::new(),
     })
 }
 
@@ -314,35 +330,44 @@ fn verify_sealed(
         bail!("private manifest hash mismatch");
     }
 
-    // Payload blob: one directory entry, ciphertext hash-checked.
+    // Payload blobs: one directory entry per payload, ciphertext hash-checked.
     let payload_entries: Vec<_> = entries.iter().filter(|e| e.tag == TAG_PAYLOAD).collect();
-    if payload_entries.len() != 1 {
+    if payload_entries.len() != envelope.payloads.len() {
         bail!(
-            "sealed artifact must carry exactly one payload blob, got {}",
-            payload_entries.len()
+            "payload blob count mismatch: directory {}, envelope {}",
+            payload_entries.len(),
+            envelope.payloads.len()
         );
     }
-    let blob = layout::slice(bytes, payload_entries[0].offset, payload_entries[0].length)?;
-    let blob_hash = sha256_hex(blob);
-    if blob_hash != envelope.payload.hash || payload_entries[0].length != envelope.payload.length {
-        bail!("payload blob hash/length mismatch");
-    }
-    let chunks = payload::chunk_count(envelope.payload.padded_length);
-    if chunks != envelope.payload.chunks {
-        bail!("payload chunk count mismatch");
-    }
-    let expected_ct_len = envelope.payload.padded_length + chunks * crypto::AEAD_TAG_LEN as u64;
-    if expected_ct_len != envelope.payload.length {
-        bail!("payload blob length does not match padded length + chunk tags");
+    let mut blob_hashes = Vec::with_capacity(envelope.payloads.len());
+    for (i, blobref) in envelope.payloads.iter().enumerate() {
+        let e = payload_entries[i];
+        let blob = layout::slice(bytes, e.offset, e.length)?;
+        let blob_hash = sha256_hex(blob);
+        if blob_hash != blobref.hash || e.length != blobref.length {
+            bail!("payload blob '{}' hash/length mismatch", blobref.name);
+        }
+        let chunks = payload::chunk_count(blobref.padded_length);
+        if chunks != blobref.chunks {
+            bail!("payload blob '{}' chunk count mismatch", blobref.name);
+        }
+        let expected_ct_len = blobref.padded_length + chunks * crypto::AEAD_TAG_LEN as u64;
+        if expected_ct_len != blobref.length {
+            bail!(
+                "payload blob '{}' length does not match padded length + chunk tags",
+                blobref.name
+            );
+        }
+        blob_hashes.push(blob_hash);
     }
 
     // Root hash over the *stored* bytes (envelope, interface, ciphertext
-    // components, ciphertext payload blob).
+    // components, ciphertext payload blobs).
     let root_hash = identity::root_hash(
         &envelope_hash,
         &interface_hash,
         &component_hashes,
-        &blob_hash,
+        &blob_hashes,
     )?;
     if root_hash != header.root_hash {
         bail!("root hash mismatch");
@@ -359,11 +384,11 @@ fn verify_sealed(
         encrypted: true,
         signed: false,
         signature_valid: None,
-        signer_fingerprint: None,
+        signer_fingerprints: Vec::new(),
     };
 
     // Plaintext tier: decrypt the private manifest and verify names, the
-    // payload tree, access scopes, and per-file plaintext hashes.
+    // payload trees, access scopes, and per-file plaintext hashes.
     if let Some(key) = content_key {
         let private_key = crypto::section_key(key, "private");
         let private_plain = crypto::open_chunk(&private_key, 0, private_bytes)?;
@@ -384,33 +409,52 @@ fn verify_sealed(
                 bail!("component '{}' plaintext hash mismatch", comp.name);
             }
         }
-        if private.payloads.len() != 1 {
+        if private.payloads.len() != envelope.payloads.len() {
             bail!(
-                "expected exactly one payload tree, got {}",
-                private.payloads.len()
+                "private/envelope payload count mismatch: {}, {}",
+                private.payloads.len(),
+                envelope.payloads.len()
             );
         }
-        let payload_ref = &private.payloads[0];
-        payload::verify_tree(&payload_ref.root)?;
-        check_access_scopes_private(&private.components, &payload_ref.root)?;
-        let payload_key = crypto::section_key(key, "payload");
-        let plaintext = open_blob(&payload_key, blob, envelope.payload.padded_length)?;
-        let mut file_list: Vec<(String, String, u64)> = Vec::new();
-        payload::collect_files(&payload_ref.root, "", &mut file_list);
-        let mut at = 0u64;
-        for (path, expected_hash, len) in &file_list {
-            let data = &plaintext[at as usize..(at + len) as usize];
-            if &payload::verify_file(data)? != expected_hash {
-                bail!("payload '{path}' plaintext hash mismatch");
+        payload::validate_payloads(&private.payloads)?;
+        check_access_scopes_private(&private.components, &private.payloads)?;
+        let mut total_files = 0;
+        for (i, payload_ref) in private.payloads.iter().enumerate() {
+            let blobref = &envelope.payloads[i];
+            if payload_ref.name != blobref.name {
+                bail!("private/envelope payload name mismatch at index {i}");
             }
-            at += len;
-        }
-        if at != payload_ref.length {
-            bail!("payload real length mismatch");
+            if payload_ref.hash != blobref.hash
+                || payload_ref.padded_length != Some(blobref.padded_length)
+                || payload_ref.chunks.len() as u64 != blobref.chunks
+            {
+                bail!(
+                    "private/envelope payload ref mismatch for '{}'",
+                    payload_ref.name
+                );
+            }
+            payload::verify_tree(&payload_ref.root)?;
+            let payload_key = crypto::section_key(key, &format!("payload/{i}"));
+            let blob = layout::slice(bytes, payload_entries[i].offset, payload_entries[i].length)?;
+            let plaintext = open_blob(&payload_key, blob, blobref.padded_length)?;
+            let mut file_list: Vec<(String, String, u64)> = Vec::new();
+            payload::collect_files(&payload_ref.root, "", &mut file_list);
+            let mut at = 0u64;
+            for (path, expected_hash, len) in &file_list {
+                let data = &plaintext[at as usize..(at + len) as usize];
+                if &payload::verify_file(data)? != expected_hash {
+                    bail!("payload '{path}' plaintext hash mismatch");
+                }
+                at += len;
+            }
+            if at != payload_ref.length {
+                bail!("payload real length mismatch");
+            }
+            total_files += file_list.len();
         }
         report.name = private.name.clone();
         report.version = private.version.clone();
-        report.payload_files = file_list.len();
+        report.payload_files = total_files;
     }
 
     Ok(report)
@@ -460,10 +504,11 @@ pub fn open_private_manifest(bytes: &[u8], content_key: &[u8; 32]) -> Result<Pri
     ciborium::de::from_reader(plain.as_slice()).context("decode private manifest")
 }
 
-fn check_access_scopes(components: &[ComponentRef], payload_root: &PayloadNode) -> Result<()> {
+fn check_access_scopes(components: &[ComponentRef], payloads: &[PayloadRef]) -> Result<()> {
     for comp in components {
         for scope in &comp.access {
-            let node = payload::find(payload_root, &scope.path)
+            let payload_ref = payload::resolve_payload(payloads, &scope.payload)?;
+            let node = payload::find(&payload_ref.root, &scope.path)
                 .with_context(|| format!("access scope '{}' not found", scope.path))?;
             if node.hash != scope.hash {
                 bail!("access scope '{}' hash mismatch", scope.path);
@@ -475,11 +520,12 @@ fn check_access_scopes(components: &[ComponentRef], payload_root: &PayloadNode) 
 
 fn check_access_scopes_private(
     components: &[PrivateComponent],
-    payload_root: &PayloadNode,
+    payloads: &[PayloadRef],
 ) -> Result<()> {
     for comp in components {
         for scope in &comp.access {
-            let node = payload::find(payload_root, &scope.path)
+            let payload_ref = payload::resolve_payload(payloads, &scope.payload)?;
+            let node = payload::find(&payload_ref.root, &scope.path)
                 .with_context(|| format!("access scope '{}' not found", scope.path))?;
             if node.hash != scope.hash {
                 bail!("access scope '{}' hash mismatch", scope.path);

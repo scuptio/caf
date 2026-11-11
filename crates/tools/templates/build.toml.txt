@@ -3,7 +3,8 @@ version = "0.1.0"
 
 interfaces = ["interfaces/{{ name }}.wit"]
 
-[payload]
+[[payloads]]
+name = "main"
 root = "payload"
 media_type = "application/octet-stream"
 

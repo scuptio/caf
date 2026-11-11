@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 ciborium = { workspace = true }
 sha2 = { workspace = true }
