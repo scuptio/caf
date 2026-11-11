@@ -2439,6 +2439,12 @@ fn cli_run_dispatch() -> Result<()> {
 }
 
 #[test]
+fn cli_versions_lists_supported_formats() -> Result<()> {
+    cli(&["caf-tool", "versions"])?;
+    Ok(())
+}
+
+#[test]
 fn content_key_for_combinations() -> Result<()> {
     let dir = temp_root("content-key")?;
     write_config(&dir, &["/data"])?;

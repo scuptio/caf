@@ -7,7 +7,8 @@
 //! `diff` examine artifacts; `run` executes a component function through
 //! `caf-runtime`; `new` scaffolds a fresh CAF project; `export` writes a ZIP
 //! containing all embedded contents; `import` rebuilds a byte-identical
-//! plaintext artifact from an export ZIP (see `doc/spec/round-trip.md`).
+//! plaintext artifact from an export ZIP (see `doc/spec/round-trip.md`);
+//! `versions` lists the supported container format versions.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -74,6 +75,8 @@ enum Command {
         #[arg(long, help = "Replace an existing output file")]
         force: bool,
     },
+    #[command(about = "List the supported container format versions")]
+    Versions,
     #[command(
         about = "Compile a payload directory, interfaces and components into a .caf artifact"
     )]
@@ -249,6 +252,33 @@ fn dispatch(command: Command) -> Result<()> {
         } => {
             import::import(&file, &output, force)?;
             println!("wrote {}", output.display());
+        }
+        Command::Versions => {
+            println!("supported container format versions:");
+            for spec in version::SUPPORTED {
+                let current = if spec.version == version::CURRENT.version {
+                    " (written by build)"
+                } else {
+                    ""
+                };
+                println!("  v{}{}", spec.version, current);
+                println!(
+                    "    header: {} bytes, {}-byte section alignment",
+                    spec.header_size, spec.align
+                );
+                println!("    payload chunk: {} bytes", spec.chunk_size);
+                println!(
+                    "    root domain: {}",
+                    String::from_utf8_lossy(spec.root_domain)
+                );
+                println!("    crypto:      {}", crypto_suite(&spec.crypto));
+            }
+            println!(
+                "export.json: accepted {}..={}, written {}",
+                export::EXPORT_FORMAT_MIN,
+                export::EXPORT_FORMAT_CURRENT,
+                export::EXPORT_FORMAT_CURRENT
+            );
         }
         Command::Build {
             config,
@@ -634,6 +664,22 @@ fn inspect_sealed(
         }
     }
     Ok(())
+}
+
+/// Wire names of a version's crypto suite (kept in sync with the serde
+/// renames in `caf_core::manifest`).
+fn crypto_suite(suite: &version::CryptoSuite) -> String {
+    use caf_core::manifest::{AeadAlgorithm, KeyWrapAlgorithm, PaddingProfile};
+    let aead = match suite.aead {
+        AeadAlgorithm::Aes256Gcm => "aes-256-gcm",
+    };
+    let wrap = match suite.wrap {
+        KeyWrapAlgorithm::P256EcdhSha256 => "p256-ecdh-sha256",
+    };
+    let padding = match suite.padding {
+        PaddingProfile::Pow2 => "pow2",
+    };
+    format!("{aead} / {wrap} / {padding} padding")
 }
 
 /// External trust store: maps signer fingerprints to publisher names.

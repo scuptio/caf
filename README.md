@@ -53,7 +53,7 @@ caf/
 │   ├── runtime/       # caf-runtime: WASM host (payload-fs ABI + capability enforcement)
 │   ├── security/      # caf-security: import admission policy + resource metering
 │   ├── guest/         # caf-guest: guest-side helpers (ABI decls, memory bridge, packed results)
-│   └── tools/         # caf-tool: build/verify/inspect/run/ls/diff/export/import/keygen + project wizard
+│   └── tools/         # caf-tool: build/verify/inspect/run/ls/diff/export/import/keygen/versions + project wizard
 ├── examples/
 │   └── gis-demo/      # a worked example profile (browser demo, no backend)
 ├── fuzz/              # cargo-fuzz targets for the parsers and verifier
@@ -102,6 +102,9 @@ cargo run -p caf-tool -- export artifact.caf -o artifact.zip --compression store
 
 # Rebuild a byte-identical .caf from the ZIP (plaintext artifacts)
 cargo run -p caf-tool -- import artifact.zip -o rebuilt.caf
+
+# List the supported container format versions (and which one build writes)
+cargo run -p caf-tool -- versions
 
 # Execute a component function (host runtime with capability enforcement)
 cargo run -p caf-tool -- run artifact.caf --fn reproject_x --args 120,30,4326,3857

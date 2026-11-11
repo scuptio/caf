@@ -57,6 +57,12 @@ Ownership rules:
 - The newest version knows its predecessor: the `vN-1 → vN` migration lives
   in `vN/migrate.rs`.
 
+`caf-tool versions` prints the registry: every supported `format_version`
+with its parameters (header size, alignment, chunk size, root domain, crypto
+suite), which version `build` writes, and the accepted `export.json` range.
+It reads `SUPPORTED`/`CURRENT` directly, so registering a version in code is
+all it takes to advertise it.
+
 ## 4. Cutting a new version (v1 → v2 worked example)
 
 1. **Freeze the old schema.** Copy the v1 schema definitions from
