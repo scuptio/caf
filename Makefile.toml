@@ -11,6 +11,7 @@
 #   cargo make install    # install the release caf-tool binary
 #   cargo make check      # fmt + clippy + test compilation (split into check-* steps)
 #   cargo make test       # cargo test --workspace
+#   cargo make coverage   # line coverage summary + HTML report (cargo-llvm-cov)
 #   cargo make doctor     # probe the dev toolchain; `-- install` adds the missing ones
 
 # Don't load cargo-make's built-in core flows (build/test/CI/publish stubs):
@@ -103,6 +104,23 @@ description = "Run cargo test --workspace"
 category = "Test"
 command = "cargo"
 args = ["test", "--workspace"]
+cwd = "${REPO_ROOT}"
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+
+# Line coverage across the workspace via cargo-llvm-cov: llvm-cov's per-file
+# table, then a per-crate totals summary and the HTML report link (written to
+# target/llvm-cov/html/index.html). Extra args pass through to
+# script/coverage.py (forwarded to cargo-llvm-cov), e.g.
+#   cargo make coverage -- --fail-under-lines 80
+[tasks.coverage]
+clear = true
+description = "Line coverage via cargo-llvm-cov: per-file table, per-crate totals, HTML report link"
+category = "Coverage"
+command = "${PYTHON}"
+args = ["${REPO_ROOT}/script/coverage.py", "${@}"]
 cwd = "${REPO_ROOT}"
 
 # ---------------------------------------------------------------------------

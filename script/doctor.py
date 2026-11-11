@@ -236,6 +236,23 @@ def cargo_fuzz_probe() -> Tuple[bool, str]:
     return (bool(which("cargo-fuzz")), version_of(["cargo", "fuzz", "--version"]))
 
 
+def llvm_tools_probe() -> Tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["rustup", "component", "list", "--installed"], text=True, capture_output=True, timeout=15
+        )
+        found = any(line.startswith("llvm-tools") for line in proc.stdout.splitlines())
+        return found, "rustup component"
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ""
+
+
+def cargo_llvm_cov_probe() -> Tuple[bool, str]:
+    # cargo subcommand binaries expect the subcommand name as argv[1]; probe
+    # through the cargo facade like cargo-make/cargo-fuzz above.
+    return (bool(which("cargo-llvm-cov")), version_of(["cargo", "llvm-cov", "--version"]))
+
+
 def collect_entries() -> List[Entry]:
     return [
         Entry("cargo", "cargo", True, tool_probe("cargo"), "all builds",
@@ -289,6 +306,16 @@ def collect_entries() -> List[Entry]:
               note=per_os("runs on the nightly toolchain: cargo fuzz run verify_bytes"),
               docs="https://github.com/rust-fuzz/cargo-fuzz",
               install=[["cargo", "install", "cargo-fuzz", "--locked"]]),
+        Entry("llvm-tools", "llvm-tools-preview component", False, llvm_tools_probe,
+              "cargo make coverage (source-based instrumentation)",
+              cmd=per_os("rustup component add llvm-tools-preview"),
+              docs="https://doc.rust-lang.org/stable/rustc/instrument-coverage.html",
+              install=[["rustup", "component", "add", "llvm-tools-preview"]]),
+        Entry("cargo-llvm-cov", "cargo-llvm-cov", False, cargo_llvm_cov_probe,
+              "cargo make coverage",
+              cmd=per_os("cargo install cargo-llvm-cov --locked"),
+              docs="https://github.com/taiki-e/cargo-llvm-cov",
+              install=[["cargo", "install", "cargo-llvm-cov", "--locked"]]),
     ]
 
 
@@ -298,7 +325,7 @@ def report(entries: List[Tuple[Entry, bool, str]], os_key: str) -> Tuple[int, in
     missing_optional = 0
     sections = (
         ("Required", "core build / check / test", True),
-        ("Optional", "examples, web demo, fuzz", False),
+        ("Optional", "examples, web demo, fuzz, coverage", False),
     )
     for title, subtitle, required in sections:
         group = [(entry, ok, detail) for entry, ok, detail in entries if entry.required == required]
