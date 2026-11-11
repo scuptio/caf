@@ -53,7 +53,7 @@ caf/
 │   ├── runtime/       # caf-runtime: WASM host (payload-fs ABI + capability enforcement)
 │   ├── security/      # caf-security: import admission policy + resource metering
 │   ├── guest/         # caf-guest: guest-side helpers (ABI decls, memory bridge, packed results)
-│   └── tools/         # caf-tool: build/verify/inspect/run/ls/diff/export/keygen + project wizard
+│   └── tools/         # caf-tool: build/verify/inspect/run/ls/diff/export/import/keygen + project wizard
 ├── examples/
 │   └── gis-demo/      # a worked example profile (browser demo, no backend)
 ├── fuzz/              # cargo-fuzz targets for the parsers and verifier
@@ -97,6 +97,11 @@ cargo run -p caf-tool -- diff a.caf b.caf            # per-section diff
 cargo run -p caf-tool -- export artifact.caf -o artifact.zip
 # Sealed artifacts require a key; the ZIP contains decrypted contents
 cargo run -p caf-tool -- export artifact.caf -o artifact.zip --recipient-key <secret hex>
+# Uncompressed export (byte-stable ZIPs across environments)
+cargo run -p caf-tool -- export artifact.caf -o artifact.zip --compression stored
+
+# Rebuild a byte-identical .caf from the ZIP (plaintext artifacts)
+cargo run -p caf-tool -- import artifact.zip -o rebuilt.caf
 
 # Execute a component function (host runtime with capability enforcement)
 cargo run -p caf-tool -- run artifact.caf --fn reproject_x --args 120,30,4326,3857
@@ -119,10 +124,12 @@ access, and enforces the deny-by-default capability policy and fuel limits.
 executing a component. It writes `manifest.cbor` (the exact stored bytes),
 `manifest.json`, `interfaces/interface.wit`, numbered `components/0000.wasm`
 files, and the original directory tree under `payload/`, including empty files
-and directories. `export.json` records export format version 1, the original
-CAF root hash, whether the source was encrypted, and component name/path mappings.
-Signature and keybox sections, when present, are retained as `signature.bin`
-and `keybox.bin`.
+and directories. `export.json` records export format version 2, the original
+CAF root hash, whether the source was encrypted, the container format version,
+and component name/path mappings. Signature and keybox sections, when present,
+are retained as `signature.bin` and `keybox.bin`. Entries are deflate-compressed
+by default; `--compression stored` writes them uncompressed for byte-stable
+ZIPs across environments.
 
 For sealed CAFs, supply `--key HEX` or `--recipient-key HEX`. The stored manifest
 is the public envelope; decrypted private metadata is exported separately as
@@ -138,10 +145,20 @@ and completion. Existing outputs require `--force`; failures preserve them.
 WIT sources are stored concatenated inside CAF, so their original filenames
 and boundaries cannot be recovered. WASM bytes reflect the embedded component,
 including any metadata added at build time. Source code, build scripts and
-`build.toml` are exported only if they were included in the payload. This ZIP
-is a content export, not a rebuild configuration: manifest references describe
-the original CAF, and the retained signature authenticates the original CAF
-root hash rather than the ZIP.
+`build.toml` are exported only if they were included in the payload.
+
+### Rebuilding from a ZIP
+
+`caf-tool import ZIP -o FILE.caf` reconstructs a **byte-identical** plaintext
+artifact from its export: the preserved `manifest.cbor` is the sole ordering
+authority, every entry is verified against it, and the rebuild is published
+only after the recomputed root hash matches `export.json` and the full strict
+verification passes — for signed artifacts the original signature verifies
+against the rebuilt bytes. The deterministic rules for
+`project → .caf ⇄ .zip` are specified in
+[`doc/spec/round-trip.md`](doc/spec/round-trip.md). Sealed artifacts cannot be
+reconstructed from a plaintext export (the ciphertext is gone); the spec
+documents the two future sealed routes.
 
 For a complete, runnable end-to-end example — including a browser host runtime,
 a WASM component, and a payload in multiple open formats — see

@@ -4,9 +4,27 @@ use caf_core::{crypto, hex, layout, manifest, payload};
 use caf_runtime::{ArtifactContents, FileSource, PayloadSource};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, io::Write, path::Path, sync::Arc};
-use zip::{ZipWriter, write::SimpleFileOptions};
+use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 const BLOCK: u64 = manifest::CHUNK_SIZE as u64;
+
+/// ZIP compression mode for `export`: `deflate` (default) or `stored`
+/// (uncompressed; removes the deflate implementation from the set of inputs
+/// the ZIP bytes depend on — see `doc/spec/round-trip.md` §3).
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Compression {
+    Deflate,
+    Stored,
+}
+
+impl Compression {
+    fn method(self) -> CompressionMethod {
+        match self {
+            Self::Deflate => CompressionMethod::Deflated,
+            Self::Stored => CompressionMethod::Stored,
+        }
+    }
+}
 
 pub fn export(
     input: &Path,
@@ -14,6 +32,7 @@ pub fn export(
     force: bool,
     key: Option<&str>,
     recipient: Option<&str>,
+    compression: Compression,
 ) -> Result<()> {
     ensure!(
         !(key.is_some() && recipient.is_some()),
@@ -119,7 +138,7 @@ pub fn export(
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     let mut zip = ZipWriter::new(temp.as_file_mut());
     let manifest_bytes = source.read_at(header.manifest_offset, header.manifest_len)?;
-    add(&mut zip, "manifest.cbor", &manifest_bytes)?;
+    add(&mut zip, "manifest.cbor", &manifest_bytes, compression)?;
     let json = if sealed {
         let envelope: manifest::Envelope = ciborium::de::from_reader(manifest_bytes.as_slice())?;
         let entry = entries
@@ -133,36 +152,46 @@ pub fn export(
         )?;
         let private: manifest::PrivateManifest =
             ciborium::de::from_reader(private_bytes.as_slice())?;
-        add(&mut zip, "private-manifest.cbor", &private_bytes)?;
+        add(
+            &mut zip,
+            "private-manifest.cbor",
+            &private_bytes,
+            compression,
+        )?;
         add(
             &mut zip,
             "private-manifest.json",
             &serde_json::to_vec_pretty(&private)?,
+            compression,
         )?;
         serde_json::to_vec_pretty(&envelope)?
     } else {
         serde_json::to_vec_pretty(artifact.manifest())?
     };
-    add(&mut zip, "manifest.json", &json)?;
+    add(&mut zip, "manifest.json", &json, compression)?;
     add(
         &mut zip,
         "interfaces/interface.wit",
         &source.read_at(header.interface_offset, header.interface_len)?,
+        compression,
     )?;
     let mut components = Vec::new();
     for (index, component) in artifact.manifest().components.iter().enumerate() {
         let path = format!("components/{index:04}.wasm");
         let bytes = artifact.wasm_bytes(index)?;
-        add(&mut zip, &path, &bytes)?;
+        add(&mut zip, &path, &bytes, compression)?;
         components.push(serde_json::json!({"name": component.name, "path": path}));
     }
-    zip.add_directory("payload/", options(0).unix_permissions(0o755))?;
+    zip.add_directory("payload/", options(0, compression).unix_permissions(0o755))?;
     for (path, node) in nodes {
         let target = format!("payload/{path}");
         if node.kind == manifest::EntryKind::Dir {
-            zip.add_directory(format!("{target}/"), options(0).unix_permissions(0o755))?;
+            zip.add_directory(
+                format!("{target}/"),
+                options(0, compression).unix_permissions(0o755),
+            )?;
         } else {
-            zip.start_file(target, options(node.length))?;
+            zip.start_file(target, options(node.length, compression))?;
             let mut hashes = Vec::new();
             let mut pos = 0;
             while pos < node.length {
@@ -190,19 +219,27 @@ pub fn export(
         } else {
             "keybox.bin"
         };
-        add(&mut zip, name, &source.read_at(entry.offset, entry.length)?)?;
+        add(
+            &mut zip,
+            name,
+            &source.read_at(entry.offset, entry.length)?,
+            compression,
+        )?;
     }
     add(
         &mut zip,
         "export.json",
         &serde_json::to_vec_pretty(&serde_json::json!({
-            "export_version": 1,
+            "export_version": 2,
             "root_hash": artifact.root_hash(),
             "source_encrypted": sealed,
+            "format_version": header.format_version,
+            "signed": header.flags & layout::FLAG_SIGNED != 0,
             "components": components,
             "manifest": if sealed { "public-envelope" } else { "manifest" },
             "signature_scope": "original-caf-root-hash"
         }))?,
+        compression,
     )?;
     zip.finish()?;
     temp.as_file().sync_all()?;
@@ -214,9 +251,9 @@ pub fn export(
     Ok(())
 }
 
-fn options(length: u64) -> SimpleFileOptions {
+fn options(length: u64, compression: Compression) -> SimpleFileOptions {
     SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_method(compression.method())
         .last_modified_time(zip::DateTime::default())
         .unix_permissions(0o644)
         // Reserve ZIP64 early enough for incompressible input whose deflate
@@ -224,8 +261,13 @@ fn options(length: u64) -> SimpleFileOptions {
         .large_file(length >= u32::MAX as u64 / 2)
 }
 
-fn add<W: Write + std::io::Seek>(zip: &mut ZipWriter<W>, name: &str, bytes: &[u8]) -> Result<()> {
-    zip.start_file(name, options(bytes.len() as u64))?;
+fn add<W: Write + std::io::Seek>(
+    zip: &mut ZipWriter<W>,
+    name: &str,
+    bytes: &[u8],
+    compression: Compression,
+) -> Result<()> {
+    zip.start_file(name, options(bytes.len() as u64, compression))?;
     zip.write_all(bytes)?;
     Ok(())
 }

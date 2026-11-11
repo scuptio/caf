@@ -596,3 +596,5 @@ size, and no format change required.
 - WIT interfaces inside an artifact follow normal semantic-import
   versioning: adding functions is a minor capability change; changing or
   removing one requires a capability version bump.
+- Byte-identical rebuild rules (reproducible build, ZIP export, and
+  reconstruction) live in `doc/spec/round-trip.md`.

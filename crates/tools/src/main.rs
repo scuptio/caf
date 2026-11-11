@@ -6,7 +6,8 @@
 //! trust store; `keygen` generates ed25519 signing keys; `inspect`, `ls`, and
 //! `diff` examine artifacts; `run` executes a component function through
 //! `caf-runtime`; `new` scaffolds a fresh CAF project; `export` writes a ZIP
-//! containing all embedded contents.
+//! containing all embedded contents; `import` rebuilds a byte-identical
+//! plaintext artifact from an export ZIP (see `doc/spec/round-trip.md`).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -21,6 +22,7 @@ mod assemble;
 mod config;
 mod export;
 mod exports;
+mod import;
 mod run;
 mod wit;
 mod wizard;
@@ -49,10 +51,28 @@ enum Command {
         output: PathBuf,
         #[arg(long, help = "Replace an existing output ZIP")]
         force: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "deflate",
+            help = "ZIP compression: deflate (default) or stored (uncompressed)"
+        )]
+        compression: export::Compression,
         #[arg(long, value_name = "HEX", conflicts_with = "recipient_key")]
         key: Option<String>,
         #[arg(long, value_name = "HEX")]
         recipient_key: Option<String>,
+    },
+    #[command(
+        about = "Rebuild a plaintext .caf from an export ZIP (byte-identical, root-hash verified)"
+    )]
+    Import {
+        #[arg(value_name = "ZIP")]
+        file: PathBuf,
+        #[arg(short, long, value_name = "CAF")]
+        output: PathBuf,
+        #[arg(long, help = "Replace an existing output file")]
+        force: bool,
     },
     #[command(
         about = "Compile a payload directory, interfaces and components into a .caf artifact"
@@ -203,6 +223,7 @@ fn main() -> Result<()> {
             file,
             output,
             force,
+            compression,
             key,
             recipient_key,
         } => {
@@ -212,7 +233,16 @@ fn main() -> Result<()> {
                 force,
                 key.as_deref(),
                 recipient_key.as_deref(),
+                compression,
             )?;
+            println!("wrote {}", output.display());
+        }
+        Command::Import {
+            file,
+            output,
+            force,
+        } => {
+            import::import(&file, &output, force)?;
             println!("wrote {}", output.display());
         }
         Command::Build {

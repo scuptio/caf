@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{assemble, config, wizard};
+use crate::{assemble, config, export::Compression, wizard};
 use caf_core::{crypto, hex, layout, manifest, payload, verify};
 
 fn temp_root(name: &str) -> Result<PathBuf> {
@@ -1433,7 +1433,7 @@ fn export_zip_preserves_contents_and_is_deterministic() -> Result<()> {
     let input = dir.join("input.caf");
     let output = dir.join("output.zip");
     std::fs::write(&input, &bytes)?;
-    crate::export::export(&input, &output, false, None, None)?;
+    crate::export::export(&input, &output, false, None, None, Compression::Deflate)?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&output)?)?;
     let header = layout::read_header(&bytes)?;
     assert_eq!(
@@ -1457,14 +1457,17 @@ fn export_zip_preserves_contents_and_is_deterministic() -> Result<()> {
     assert!(zip.by_name("payload/empty-dir/")?.is_dir());
     assert_eq!(zip_bytes(&mut zip, "signature.bin")?.len(), 96);
     let metadata: serde_json::Value = serde_json::from_slice(&zip_bytes(&mut zip, "export.json")?)?;
+    assert_eq!(metadata["export_version"], 2);
     assert_eq!(metadata["components"][0]["name"], "spatial");
     assert_eq!(metadata["root_hash"], hex::encode(&header.root_hash));
     let second = dir.join("second.zip");
-    crate::export::export(&input, &second, false, None, None)?;
+    crate::export::export(&input, &second, false, None, None, Compression::Deflate)?;
     assert_eq!(std::fs::read(&output)?, std::fs::read(&second)?);
-    assert!(crate::export::export(&input, &output, false, None, None).is_err());
-    crate::export::export(&input, &output, true, None, None)?;
-    assert!(crate::export::export(&input, &input, true, None, None).is_err());
+    assert!(
+        crate::export::export(&input, &output, false, None, None, Compression::Deflate).is_err()
+    );
+    crate::export::export(&input, &output, true, None, None, Compression::Deflate)?;
+    assert!(crate::export::export(&input, &input, true, None, None, Compression::Deflate).is_err());
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -1481,8 +1484,20 @@ fn export_sealed_zip_requires_key_and_exports_plaintext() -> Result<()> {
     let input = dir.join("input.caf");
     let output = dir.join("output.zip");
     std::fs::write(&input, &bytes)?;
-    assert!(crate::export::export(&input, &output, false, None, None).is_err());
-    assert!(crate::export::export(&input, &output, false, Some(&"00".repeat(32)), None).is_err());
+    assert!(
+        crate::export::export(&input, &output, false, None, None, Compression::Deflate).is_err()
+    );
+    assert!(
+        crate::export::export(
+            &input,
+            &output,
+            false,
+            Some(&"00".repeat(32)),
+            None,
+            Compression::Deflate
+        )
+        .is_err()
+    );
     assert!(!output.exists());
     crate::export::export(
         &input,
@@ -1490,6 +1505,7 @@ fn export_sealed_zip_requires_key_and_exports_plaintext() -> Result<()> {
         false,
         None,
         Some(&hex::encode(&secret.to_bytes())),
+        Compression::Deflate,
     )?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&output)?)?;
     assert_eq!(
@@ -1502,7 +1518,14 @@ fn export_sealed_zip_requires_key_and_exports_plaintext() -> Result<()> {
         ciborium::de::from_reader(zip_bytes(&mut zip, "private-manifest.cbor")?.as_slice())?;
     assert_eq!(private.name, exported.name);
     let second = dir.join("second.zip");
-    crate::export::export(&input, &second, false, Some(&hex::encode(&key)), None)?;
+    crate::export::export(
+        &input,
+        &second,
+        false,
+        Some(&hex::encode(&key)),
+        None,
+        Compression::Deflate,
+    )?;
     assert_eq!(std::fs::read(&output)?, std::fs::read(&second)?);
     std::fs::remove_dir_all(dir)?;
     Ok(())
@@ -1529,7 +1552,9 @@ fn export_failure_preserves_existing_output_and_cleans_temporary_file() -> Resul
     std::fs::write(&input, bytes)?;
     std::fs::write(&output, b"original output")?;
     let count = std::fs::read_dir(&dir)?.count();
-    assert!(crate::export::export(&input, &output, true, None, None).is_err());
+    assert!(
+        crate::export::export(&input, &output, true, None, None, Compression::Deflate).is_err()
+    );
     assert_eq!(std::fs::read(&output)?, b"original output");
     assert_eq!(std::fs::read_dir(&dir)?.count(), count);
     std::fs::remove_dir_all(dir)?;
@@ -1550,7 +1575,14 @@ fn export_does_not_require_execution_admission() -> Result<()> {
     assert!(caf_runtime::Artifact::open(bytes.clone()).is_err());
     let input = dir.join("input.caf");
     std::fs::write(&input, bytes)?;
-    crate::export::export(&input, &dir.join("output.zip"), false, None, None)?;
+    crate::export::export(
+        &input,
+        &dir.join("output.zip"),
+        false,
+        None,
+        None,
+        Compression::Deflate,
+    )?;
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
@@ -1566,7 +1598,10 @@ fn export_rejects_conflicting_or_unsafe_payload_paths() -> Result<()> {
         let input = dir.join("input.caf");
         let output = dir.join("output.zip");
         std::fs::write(&input, build_bytes(&dir)?)?;
-        assert!(crate::export::export(&input, &output, false, None, None).is_err());
+        assert!(
+            crate::export::export(&input, &output, false, None, None, Compression::Deflate)
+                .is_err()
+        );
         assert!(!output.exists());
         std::fs::remove_dir_all(dir)?;
     }
@@ -1612,9 +1647,222 @@ fn export_rejects_invalid_signature_and_corrupted_sealed_padding() -> Result<()>
         let input = dir.join("input.caf");
         let output = dir.join("output.zip");
         std::fs::write(&input, bytes)?;
-        assert!(crate::export::export(&input, &output, false, key.as_deref(), None).is_err());
+        assert!(
+            crate::export::export(
+                &input,
+                &output,
+                false,
+                key.as_deref(),
+                None,
+                Compression::Deflate
+            )
+            .is_err()
+        );
         assert!(!output.exists());
         std::fs::remove_dir_all(dir)?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// import: byte-identical reconstruction from an export ZIP (round-trip).
+// ---------------------------------------------------------------------------
+
+/// Copy the `src` ZIP to `dst`, applying `edit` to the `target` entry's bytes.
+fn rewrite_zip(src: &Path, dst: &Path, target: &str, edit: impl Fn(&mut Vec<u8>)) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(src)?)?;
+    let mut out = zip::ZipWriter::new(std::fs::File::create(dst)?);
+    let options = zip::write::SimpleFileOptions::default();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let name = entry.name().to_string();
+        if entry.is_dir() {
+            out.add_directory(&name, options)?;
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        if name == target {
+            edit(&mut bytes);
+        }
+        out.start_file(&name, options)?;
+        out.write_all(&bytes)?;
+    }
+    out.finish()?;
+    Ok(())
+}
+
+#[test]
+fn import_roundtrip_is_byte_identical() -> Result<()> {
+    let dir = temp_root("import-roundtrip")?;
+    write_signed_config(&dir, &["/data"])?;
+    std::fs::create_dir_all(dir.join("payload/empty-dir"))?;
+    std::fs::write(dir.join("payload/empty"), [])?;
+    std::fs::write(
+        dir.join("payload/large.bin"),
+        vec![0x5a; 2 * 1024 * 1024 + 17],
+    )?;
+    let bytes = build_bytes(&dir)?;
+    let caf = dir.join("input.caf");
+    let zip_path = dir.join("output.zip");
+    let rebuilt = dir.join("rebuilt.caf");
+    std::fs::write(&caf, &bytes)?;
+    crate::export::export(&caf, &zip_path, false, None, None, Compression::Deflate)?;
+    crate::import::import(&zip_path, &rebuilt, false)?;
+    assert_eq!(
+        std::fs::read(&rebuilt)?,
+        bytes,
+        "build -> export -> import must reproduce the original bytes"
+    );
+    let report = verify::verify_bytes(&std::fs::read(&rebuilt)?)?;
+    assert_eq!(report.signature_valid, Some(true));
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn import_roundtrip_unsigned() -> Result<()> {
+    let dir = temp_root("import-unsigned")?;
+    write_config(&dir, &["/data", "/index"])?;
+    let bytes = build_bytes(&dir)?;
+    assert!(!verify::verify_bytes(&bytes)?.signed);
+    let caf = dir.join("input.caf");
+    let zip_path = dir.join("output.zip");
+    let rebuilt = dir.join("rebuilt.caf");
+    std::fs::write(&caf, &bytes)?;
+    crate::export::export(&caf, &zip_path, false, None, None, Compression::Deflate)?;
+    crate::import::import(&zip_path, &rebuilt, false)?;
+    assert_eq!(std::fs::read(&rebuilt)?, bytes);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn import_rejects_sealed_export() -> Result<()> {
+    let dir = temp_root("import-sealed")?;
+    let (secret, public) = recipient_keypair();
+    write_sealed_config(&dir, &["/data"], &public, None, None)?;
+    let bytes = build_bytes(&dir)?;
+    let caf = dir.join("input.caf");
+    let zip_path = dir.join("output.zip");
+    std::fs::write(&caf, &bytes)?;
+    crate::export::export(
+        &caf,
+        &zip_path,
+        false,
+        None,
+        Some(&hex::encode(&secret.to_bytes())),
+        Compression::Deflate,
+    )?;
+    let err = crate::import::import(&zip_path, &dir.join("out.caf"), false).unwrap_err();
+    assert!(format!("{err:#}").contains("sealed"), "{err:#}");
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn import_detects_tampering() -> Result<()> {
+    let dir = temp_root("import-tamper")?;
+    write_config(&dir, &["/data"])?;
+    let bytes = build_bytes(&dir)?;
+    let caf = dir.join("input.caf");
+    let good = dir.join("good.zip");
+    std::fs::write(&caf, &bytes)?;
+    crate::export::export(&caf, &good, false, None, None, Compression::Deflate)?;
+
+    // A flipped payload byte breaks the per-file Merkle check.
+    let bad = dir.join("bad-payload.zip");
+    rewrite_zip(&good, &bad, "payload/data/city.parquet", |b| b[0] ^= 1)?;
+    let err = crate::import::import(&bad, &dir.join("out.caf"), false).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("does not match the manifest"),
+        "{err:#}"
+    );
+
+    // A rewritten export.json root hash breaks the identity gate.
+    let bad = dir.join("bad-meta.zip");
+    rewrite_zip(&good, &bad, "export.json", |b| {
+        let mut meta: serde_json::Value = serde_json::from_slice(b).unwrap();
+        meta["root_hash"] = "00".repeat(32).into();
+        *b = serde_json::to_vec_pretty(&meta).unwrap();
+    })?;
+    assert!(crate::import::import(&bad, &dir.join("out2.caf"), false).is_err());
+
+    // An undeclared payload entry is rejected.
+    let bad = dir.join("bad-extra.zip");
+    {
+        use std::io::{Read, Write};
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&good)?)?;
+        let mut out = zip::ZipWriter::new(std::fs::File::create(&bad)?);
+        let options = zip::write::SimpleFileOptions::default();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let name = entry.name().to_string();
+            if entry.is_dir() {
+                out.add_directory(&name, options)?;
+                continue;
+            }
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            out.start_file(&name, options)?;
+            out.write_all(&bytes)?;
+        }
+        out.start_file("payload/sneaky.txt", options)?;
+        out.write_all(b"sneaky")?;
+        out.finish()?;
+    }
+    let err = crate::import::import(&bad, &dir.join("out3.caf"), false).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("undeclared payload entry"),
+        "{err:#}"
+    );
+
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn import_refuses_overwrite_and_self_overwrite() -> Result<()> {
+    let dir = temp_root("import-overwrite")?;
+    write_config(&dir, &["/data"])?;
+    let bytes = build_bytes(&dir)?;
+    let caf = dir.join("input.caf");
+    let zip_path = dir.join("output.zip");
+    std::fs::write(&caf, &bytes)?;
+    crate::export::export(&caf, &zip_path, false, None, None, Compression::Deflate)?;
+    let out = dir.join("out.caf");
+    std::fs::write(&out, b"existing")?;
+    assert!(crate::import::import(&zip_path, &out, false).is_err());
+    assert_eq!(std::fs::read(&out)?, b"existing");
+    crate::import::import(&zip_path, &out, true)?;
+    assert_eq!(std::fs::read(&out)?, bytes);
+    assert!(crate::import::import(&zip_path, &zip_path, true).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn export_stored_compression_is_byte_deterministic() -> Result<()> {
+    let dir = temp_root("export-stored")?;
+    write_config(&dir, &["/data"])?;
+    let bytes = build_bytes(&dir)?;
+    let caf = dir.join("input.caf");
+    std::fs::write(&caf, &bytes)?;
+    let a = dir.join("a.zip");
+    let b = dir.join("b.zip");
+    crate::export::export(&caf, &a, false, None, None, Compression::Stored)?;
+    crate::export::export(&caf, &b, false, None, None, Compression::Stored)?;
+    assert_eq!(std::fs::read(&a)?, std::fs::read(&b)?);
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&a)?)?;
+    assert_eq!(
+        archive.by_name("manifest.cbor")?.compression(),
+        zip::CompressionMethod::Stored
+    );
+    // Stored exports round-trip through import exactly like deflated ones.
+    let rebuilt = dir.join("rebuilt.caf");
+    crate::import::import(&a, &rebuilt, false)?;
+    assert_eq!(std::fs::read(&rebuilt)?, bytes);
+    std::fs::remove_dir_all(dir)?;
     Ok(())
 }
