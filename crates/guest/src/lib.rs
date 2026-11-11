@@ -241,3 +241,61 @@ pub fn abort_with(code: i32) -> ! {
     #[cfg(not(target_arch = "wasm32"))]
     unreachable!("host abort() returned");
 }
+
+// ---------------------------------------------------------------------------
+// Host-side tests. The ABI is 32-bit-pointer based, so only the fail-closed
+// wrapper paths and the pointer-free bridge entry points can run on a host
+// target; the dereferencing paths execute on wasm32 (see examples/gis-demo).
+// ---------------------------------------------------------------------------
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_reports_zero_length_without_allocating() {
+        assert_eq!(alloc(0), 0);
+        // A non-zero allocation returns a handle; the buffer stays leaked for
+        // the host (dealloc with a truncated host pointer would be UB).
+        assert_ne!(alloc(16), 0);
+    }
+
+    #[test]
+    fn dealloc_rejects_zero_length_and_null() {
+        unsafe {
+            dealloc(0, 8);
+            dealloc(1, 0);
+            dealloc(0, 0);
+        }
+    }
+
+    #[test]
+    fn return_bytes_packs_len_into_the_high_word() {
+        let packed = return_bytes(b"hello");
+        assert_eq!(packed >> 32, 5);
+        assert_ne!(packed & 0xffff_ffff, 0);
+    }
+
+    #[test]
+    fn return_str_counts_utf8_bytes() {
+        assert_eq!(return_str("héllo") >> 32, 6);
+        assert_eq!(return_str("") >> 32, 0);
+    }
+
+    /// The host stubs fail closed, so every wrapper surfaces its error path.
+    #[test]
+    fn host_wrappers_fail_closed_off_wasm() {
+        assert!(read_payload("/x").is_err());
+        assert!(read_payload_range("/x", 0, 4).is_err());
+        assert_eq!(payload_len("/x"), None);
+        assert!(list_dir("/x").is_err());
+        assert!(emit_bytes(b"x").is_err());
+        log_line("diagnostic");
+        assert_eq!(artifact_size(), u64::MAX); // stub self_size() == -1
+    }
+
+    #[test]
+    #[should_panic]
+    fn abort_with_traps_when_the_host_stub_returns() {
+        abort_with(7);
+    }
+}

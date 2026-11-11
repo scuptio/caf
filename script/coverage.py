@@ -22,6 +22,11 @@ from output import bad, bold, cmd, dim, good, highlight, link, warn  # noqa: E40
 
 OUT_DIR = REPO_ROOT / "target" / "llvm-cov"
 
+# caf-guest is wasm32-only: its ABI passes 32-bit pointers, so host runs can
+# only exercise the fail-closed stubs. It is covered by the gis-demo e2e
+# (real wasm guest), not by llvm-cov.
+IGNORE_GUEST = ["--ignore-filename-regex", "/crates/guest/"]
+
 
 def run_coverage(args: List[str]) -> int:
     argv = [
@@ -31,6 +36,7 @@ def run_coverage(args: List[str]) -> int:
         "--html",
         "--output-dir",
         str(OUT_DIR),
+        *IGNORE_GUEST,
         *args,
     ]
     cmd(argv)
@@ -40,7 +46,7 @@ def run_coverage(args: List[str]) -> int:
 
 def summary_json() -> Optional[dict]:
     proc = subprocess.run(
-        ["cargo", "llvm-cov", "report", "--summary-only", "--json"],
+        ["cargo", "llvm-cov", "report", "--summary-only", "--json", *IGNORE_GUEST],
         text=True,
         capture_output=True,
     )
@@ -98,6 +104,7 @@ def print_summary(data: dict) -> None:
         f"  {bold('TOTAL'.ljust(width))}  {paint_pct(percent)}  "
         + dim(f"({total_covered}/{total_count} lines)")
     )
+    print(dim("  (caf-guest excluded: wasm32-only ABI, covered by the gis-demo e2e)"))
     print()
     index = OUT_DIR / "html" / "index.html"
     print(f"  {dim('HTML report:')} {link(str(index), index.as_uri())}")

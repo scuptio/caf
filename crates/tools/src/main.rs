@@ -217,8 +217,13 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    dispatch(Cli::parse().command)
+}
+
+/// Dispatch one parsed subcommand; separated from `main` so tests can drive
+/// the CLI surface without spawning a process.
+fn dispatch(command: Command) -> Result<()> {
+    match command {
         Command::Export {
             file,
             output,

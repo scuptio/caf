@@ -1909,3 +1909,587 @@ fn build_rejects_unsupported_format_version() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// exports.rs: WASM export enumeration and validation edge cases.
+// ---------------------------------------------------------------------------
+
+/// Module exporting one of each core kind: func, table, memory, global.
+fn wasm_all_export_kinds() -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x00])); // type ()->()
+    wasm.extend(wasm_section(3, &[0x01, 0x00])); // func 0 : type 0
+    wasm.extend(wasm_section(4, &[0x01, 0x70, 0x00, 0x00])); // table funcref min 0
+    wasm.extend(wasm_section(5, &[0x01, 0x00, 0x01])); // memory min 1
+    wasm.extend(wasm_section(6, &[0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b])); // global i32 = 0
+    let mut exports = vec![0x04];
+    for (name, kind) in [("f", 0x00u8), ("t", 0x01), ("m", 0x02), ("g", 0x03)] {
+        exports.push(0x01);
+        exports.extend(name.as_bytes());
+        exports.extend([kind, 0x00]);
+    }
+    wasm.extend(wasm_section(7, &exports));
+    wasm.extend(wasm_section(10, &[0x01, 0x02, 0x00, 0x0b])); // empty body
+    wasm
+}
+
+#[test]
+fn extract_exports_covers_all_core_kinds() {
+    let exports = crate::exports::extract_exports(&wasm_all_export_kinds());
+    let signatures: Vec<(&str, &str)> = exports
+        .iter()
+        .map(|e| (e.export.as_str(), e.signature.as_str()))
+        .collect();
+    assert_eq!(
+        signatures,
+        [
+            ("f", "func"),
+            ("t", "table"),
+            ("m", "memory"),
+            ("g", "global")
+        ]
+    );
+    assert!(exports.iter().all(|e| e.capability.is_empty()));
+}
+
+#[test]
+fn extract_exports_is_best_effort_on_garbage_and_truncation() {
+    assert!(crate::exports::extract_exports(b"\0asm garbage").is_empty());
+
+    // An export entry cut off mid-record keeps the entries parsed so far.
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x00]));
+    wasm.extend(wasm_section(3, &[0x01, 0x00]));
+    let mut exports = vec![0x02]; // declares two entries
+    exports.extend([0x01, b'f', 0x00, 0x00]); // one complete entry
+    exports.extend([0x01, b't']); // second entry truncated
+    wasm.extend(wasm_section(7, &exports));
+    let exports = crate::exports::extract_exports(&wasm);
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0].export, "f");
+}
+
+#[test]
+fn core_exports_rejects_invalid_and_component_modules() {
+    // A function referencing a missing type fails validation.
+    let mut bad = b"\0asm\x01\0\0\0".to_vec();
+    bad.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x00]));
+    bad.extend(wasm_section(3, &[0x01, 0x09])); // func : type 9 (missing)
+    let err = crate::exports::core_exports(&bad)
+        .err()
+        .context("invalid module must fail")
+        .unwrap();
+    assert!(
+        format!("{err:#}").contains("validate WASM module"),
+        "{err:#}"
+    );
+
+    // A component binary is not a format v1 component.
+    let component = b"\0asm\x0d\x00\x01\x00";
+    let err = crate::exports::core_exports(component)
+        .err()
+        .context("component must fail")
+        .unwrap();
+    assert!(format!("{err:#}").contains("core WASM module"), "{err:#}");
+}
+
+#[test]
+fn core_exports_rejects_ambiguous_normalized_names() {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x00]));
+    wasm.extend(wasm_section(3, &[0x02, 0x00, 0x00]));
+    let mut exports = vec![0x02];
+    exports.extend([0x07]);
+    exports.extend(b"foo_bar");
+    exports.extend([0x00, 0x00]);
+    exports.extend([0x07]);
+    exports.extend(b"foo-bar");
+    exports.extend([0x00, 0x01]);
+    wasm.extend(wasm_section(7, &exports));
+    wasm.extend(wasm_section(
+        10,
+        &[0x02, 0x02, 0x00, 0x0b, 0x02, 0x00, 0x0b],
+    ));
+    let err = crate::exports::core_exports(&wasm)
+        .err()
+        .context("clashing names must fail")
+        .unwrap();
+    assert!(format!("{err:#}").contains("ambiguous"), "{err:#}");
+}
+
+#[test]
+fn core_exports_classifies_memory32() -> Result<()> {
+    // A 32-bit memory (imported here) exported as "memory" is memory32.
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    let mut imports = vec![0x01];
+    imports.extend([0x03]);
+    imports.extend(b"env");
+    imports.extend([0x03]);
+    imports.extend(b"mem");
+    imports.extend([0x02, 0x00, 0x01]); // memory import, min 1
+    wasm.extend(wasm_section(2, &imports));
+    wasm.extend(wasm_section(7, b"\x01\x06memory\x02\x00"));
+    assert!(crate::exports::core_exports(&wasm)?.memory32);
+
+    // memory64 is not memory32.
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(5, &[0x01, 0x05, 0x01, 0x01])); // memory64 min 1 max 1
+    wasm.extend(wasm_section(7, b"\x01\x06memory\x02\x00"));
+    assert!(!crate::exports::core_exports(&wasm)?.memory32);
+
+    // A shared memory is not memory32 either.
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(5, &[0x01, 0x03, 0x01, 0x01])); // shared min 1 max 1
+    wasm.extend(wasm_section(7, b"\x01\x06memory\x02\x00"));
+    assert!(!crate::exports::core_exports(&wasm)?.memory32);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// wizard.rs: scaffold every language plus the rejection paths.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wizard_scaffolds_all_languages() -> Result<()> {
+    let dir = temp_root("wizard-langs")?;
+    for lang in [
+        wizard::Language::Python,
+        wizard::Language::JavaScript,
+        wizard::Language::TinyGo,
+        wizard::Language::ActionScript,
+    ] {
+        let name = format!("demo-{lang:?}").to_lowercase();
+        wizard::scaffold(&name, lang, &dir)?;
+        let root = dir.join(&name);
+        assert!(root.join("build.toml").exists());
+        assert!(root.join("README.md").exists());
+        assert!(root.join(format!("interfaces/{name}.wit")).exists());
+        assert!(root.join("payload/.gitkeep").exists());
+    }
+    assert!(dir.join("demo-python/app.py").exists());
+    assert!(dir.join("demo-javascript/src/component.js").exists());
+    assert!(dir.join("demo-javascript/package.json").exists());
+    assert!(dir.join("demo-tinygo/main.go").exists());
+    assert!(dir.join("demo-tinygo/go.mod").exists());
+    assert!(dir.join("demo-actionscript/src/Main.as").exists());
+
+    // Hyphenated names map to underscore crate names; build.sh is executable.
+    wizard::scaffold("my-rust", wizard::Language::Rust, &dir)?;
+    let build_sh = dir.join("my-rust/build.sh");
+    let text = std::fs::read_to_string(&build_sh)?;
+    assert!(text.contains("my_rust"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&build_sh)?.permissions().mode() & 0o111,
+            0o111
+        );
+    }
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn wizard_rejects_invalid_names_and_existing_dirs() -> Result<()> {
+    let dir = temp_root("wizard-invalid")?;
+    for name in ["", "a/b", "a\\b"] {
+        assert!(wizard::scaffold(name, wizard::Language::Rust, &dir).is_err());
+    }
+    wizard::scaffold("taken", wizard::Language::Rust, &dir)?;
+    assert!(wizard::scaffold("taken", wizard::Language::Python, &dir).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// run.rs: caf-tool run against fixture components.
+// ---------------------------------------------------------------------------
+
+/// `answer: () -> i32` returning 42 (the scalar fixture).
+fn wasm_scalar_answer() -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x01, 0x7f]));
+    wasm.extend(wasm_section(3, &[0x01, 0x00]));
+    wasm.extend(wasm_section(7, b"\x01\x06answer\x00\x00"));
+    wasm.extend(wasm_section(10, &[0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b]));
+    wasm
+}
+
+/// `greet: () -> i64` returning the packed (ptr 0 | len 5 << 32) string
+/// "hello", plus the exported memory it points into.
+fn wasm_packed_string() -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(1, &[0x01, 0x60, 0x00, 0x01, 0x7e])); // ()->i64
+    wasm.extend(wasm_section(3, &[0x01, 0x00]));
+    wasm.extend(wasm_section(5, &[0x01, 0x00, 0x01])); // memory min 1
+    let mut exports = vec![0x02];
+    exports.extend(b"\x05greet\x00\x00");
+    exports.extend(b"\x06memory\x02\x00");
+    wasm.extend(wasm_section(7, &exports));
+    // i64.const 21474836480 (5 << 32), end
+    wasm.extend(wasm_section(
+        10,
+        &[
+            0x01, 0x09, 0x00, 0x42, 0x80, 0x80, 0x80, 0x80, 0xd0, 0x00, 0x0b,
+        ],
+    ));
+    // data "hello" at offset 0
+    let mut data = vec![0x01, 0x00, 0x41, 0x00, 0x0b, 0x05];
+    data.extend(b"hello");
+    wasm.extend(wasm_section(11, &data));
+    wasm
+}
+
+/// `add4: (i32, i64, f32, f64) -> i32`.
+fn wasm_add4() -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    wasm.extend(wasm_section(
+        1,
+        &[0x01, 0x60, 0x04, 0x7f, 0x7e, 0x7d, 0x7c, 0x01, 0x7f],
+    ));
+    wasm.extend(wasm_section(3, &[0x01, 0x00]));
+    wasm.extend(wasm_section(7, b"\x01\x04add4\x00\x00"));
+    wasm.extend(wasm_section(10, &[0x01, 0x04, 0x00, 0x41, 0x00, 0x0b]));
+    wasm
+}
+
+/// A component without a WIT world: the manifest export fallback path.
+fn write_nowit_config(dir: &Path, wasm: &[u8]) -> Result<()> {
+    std::fs::write(
+        dir.join("build.toml"),
+        "name = \"raw\"\nversion = \"0.1.0\"\ninterfaces = []\n\n[payload]\nroot = \"payload\"\nmedia_type = \"application/x-raw\"\n\n[[components]]\nname = \"raw\"\nworld = \"\"\npath = \"raw.wasm\"\ncapabilities = []\naccess = []\n",
+    )?;
+    std::fs::write(dir.join("raw.wasm"), wasm)?;
+    Ok(())
+}
+
+fn build_to_caf(dir: &Path) -> Result<PathBuf> {
+    let bytes = build_bytes(dir)?;
+    let caf = dir.join("artifact.caf");
+    std::fs::write(&caf, &bytes)?;
+    Ok(caf)
+}
+
+#[test]
+fn run_calls_scalar_export() -> Result<()> {
+    let dir = temp_root("run-scalar")?;
+    write_config_full(&dir, &["/data"], &wasm_scalar_answer(), "")?;
+    std::fs::write(
+        dir.join("spatial.wit"),
+        "package cf:gis@0.1.0; world spatial-file { export answer: func() -> u32; }",
+    )?;
+    bind_test_capabilities(&dir, &["cf:answer@1"])?;
+    let caf = build_to_caf(&dir)?;
+    crate::run::run(&caf, "answer", &[], None, false, None)?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn run_decodes_packed_string_results_unless_raw() -> Result<()> {
+    let dir = temp_root("run-string")?;
+    write_nowit_config(&dir, &wasm_packed_string())?;
+    let caf = build_to_caf(&dir)?;
+    crate::run::run(&caf, "greet", &[], None, false, None)?;
+    crate::run::run(&caf, "greet", &[], None, true, None)?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn run_parses_all_scalar_arg_types() -> Result<()> {
+    let dir = temp_root("run-args")?;
+    write_nowit_config(&dir, &wasm_add4())?;
+    let caf = build_to_caf(&dir)?;
+    crate::run::run(
+        &caf,
+        "add4",
+        &["1".into(), "2".into(), "1.5".into(), "2.5".into()],
+        None,
+        true,
+        None,
+    )?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn run_reports_cli_style_errors() -> Result<()> {
+    let dir = temp_root("run-errors")?;
+    write_nowit_config(&dir, &wasm_add4())?;
+    let caf = build_to_caf(&dir)?;
+    // Missing artifact file.
+    assert!(crate::run::run(&dir.join("nope.caf"), "add4", &[], None, false, None).is_err());
+    // Unknown component name.
+    assert!(crate::run::run(&caf, "add4", &[], Some("nope"), false, None).is_err());
+    // Unknown export.
+    assert!(crate::run::run(&caf, "nope", &[], None, false, None).is_err());
+    // Wrong arity.
+    assert!(crate::run::run(&caf, "add4", &[], None, false, None).is_err());
+    // Unparsable i32.
+    assert!(
+        crate::run::run(
+            &caf,
+            "add4",
+            &["x".into(), "2".into(), "1.5".into(), "2.5".into()],
+            None,
+            false,
+            None
+        )
+        .is_err()
+    );
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn run_opens_sealed_artifacts_with_a_key() -> Result<()> {
+    let dir = temp_root("run-sealed")?;
+    let (secret, public) = recipient_keypair();
+    write_sealed_config(&dir, &["/data"], &public, None, None)?;
+    std::fs::write(
+        dir.join("spatial.wit"),
+        "package cf:gis@0.1.0; world spatial-file { export answer: func() -> u32; }",
+    )?;
+    std::fs::write(dir.join("spatial.wasm"), wasm_scalar_answer())?;
+    let bytes = build_bytes(&dir)?;
+    let key = crypto::unwrap_artifact(&bytes, &secret)?.context("no content key")?;
+    let caf = dir.join("sealed.caf");
+    std::fs::write(&caf, &bytes)?;
+    crate::run::run(&caf, "answer", &[], None, false, Some(key))?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// main.rs: CLI dispatch coverage (Cli::try_parse_from + dispatch).
+// ---------------------------------------------------------------------------
+
+use clap::Parser;
+
+fn cli(args: &[&str]) -> Result<()> {
+    crate::dispatch(crate::Cli::try_parse_from(args)?.command)
+}
+
+fn sp(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn cli_build_verify_inspect_ls_diff_export_import() -> Result<()> {
+    let dir = temp_root("cli-main")?;
+    write_config(&dir, &["/data"])?;
+    let caf = dir.join("a.caf");
+    let dump = dir.join("dump.json");
+    cli(&[
+        "caf-tool",
+        "build",
+        "-c",
+        &sp(&dir.join("build.toml")),
+        "-o",
+        &sp(&caf),
+        "--dump-manifest",
+        &sp(&dump),
+    ])?;
+    assert!(dump.exists());
+    let caf = sp(&caf);
+    cli(&["caf-tool", "verify", &caf])?;
+    cli(&["caf-tool", "inspect", &caf])?;
+    cli(&["caf-tool", "inspect", &caf, "--json"])?;
+    cli(&["caf-tool", "ls", &caf])?;
+    cli(&["caf-tool", "diff", &caf, &caf])?;
+
+    // A differing artifact exercises the diff detail branches.
+    std::fs::write(dir.join("payload/data/city.parquet"), b"changed")?;
+    let other = sp(&dir.join("b.caf"));
+    std::fs::write(&other, build_bytes(&dir)?)?;
+    cli(&["caf-tool", "diff", &caf, &other])?;
+
+    let zip = sp(&dir.join("a.zip"));
+    cli(&["caf-tool", "export", &caf, "-o", &zip])?;
+    cli(&[
+        "caf-tool",
+        "export",
+        &caf,
+        "-o",
+        &sp(&dir.join("b.zip")),
+        "--compression",
+        "stored",
+    ])?;
+    cli(&[
+        "caf-tool",
+        "import",
+        &zip,
+        "-o",
+        &sp(&dir.join("rebuilt.caf")),
+    ])?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn cli_build_sealed_and_inspect_with_keys() -> Result<()> {
+    let dir = temp_root("cli-sealed")?;
+    let (secret, public) = recipient_keypair();
+    write_sealed_config(&dir, &["/data"], &public, Some(&"99".repeat(32)), None)?;
+    let caf = dir.join("s.caf");
+    let dump = dir.join("dump.json");
+    cli(&[
+        "caf-tool",
+        "build",
+        "-c",
+        &sp(&dir.join("build.toml")),
+        "-o",
+        &sp(&caf),
+        "--dump-manifest",
+        &sp(&dump),
+    ])?;
+    let caf = sp(&caf);
+    let bytes = std::fs::read(&caf)?;
+    let content_key = crypto::unwrap_artifact(&bytes, &secret)?.context("no content key")?;
+    let key = hex::encode(&content_key);
+    cli(&["caf-tool", "verify", &caf])?; // public tier
+    cli(&["caf-tool", "verify", &caf, "--key", &key])?; // full tier
+    cli(&["caf-tool", "inspect", &caf])?; // sealed, public tier only
+    cli(&["caf-tool", "inspect", &caf, "--key", &key])?;
+    cli(&["caf-tool", "inspect", &caf, "--key", &key, "--json"])?;
+    cli(&["caf-tool", "ls", &caf, "--key", &key])?;
+    cli(&[
+        "caf-tool",
+        "verify",
+        &caf,
+        "--recipient-key",
+        &hex::encode(&secret.to_bytes()),
+    ])?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn cli_keygen_and_new() -> Result<()> {
+    let dir = temp_root("cli-misc")?;
+    cli(&["caf-tool", "keygen"])?;
+    cli(&["caf-tool", "keygen", "--recipient"])?;
+    cli(&["caf-tool", "new", "demo", "--dir", &sp(&dir)])?;
+    assert!(dir.join("demo/build.toml").exists());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn cli_verify_trust_store_paths() -> Result<()> {
+    use ed25519_dalek::SigningKey;
+    let dir = temp_root("cli-trust")?;
+    write_signed_config(&dir, &["/data"])?;
+    let caf = sp(&build_to_caf(&dir)?);
+    let seed: [u8; 32] = hex::decode(&"11".repeat(32))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("seed length"))?;
+    let pubkey = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let store = dir.join("trusted.toml");
+    std::fs::write(
+        &store,
+        format!(
+            "[keys]\n\"{}\" = \"Test Publisher\"\n",
+            payload::chunk_hash(&pubkey)
+        ),
+    )?;
+    cli(&[
+        "caf-tool",
+        "verify",
+        &caf,
+        "--trusted-keys",
+        &sp(&store),
+        "--require-trusted",
+    ])?;
+    // A store that does not contain the signer fails --require-trusted.
+    let empty = dir.join("empty.toml");
+    std::fs::write(&empty, "[keys]\n")?;
+    assert!(
+        cli(&[
+            "caf-tool",
+            "verify",
+            &caf,
+            "--trusted-keys",
+            &sp(&empty),
+            "--require-trusted"
+        ])
+        .is_err()
+    );
+    // --require-trusted without a store is a usage error.
+    assert!(cli(&["caf-tool", "verify", &caf, "--require-trusted"]).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn cli_run_dispatch() -> Result<()> {
+    let dir = temp_root("cli-run")?;
+    write_config_full(&dir, &["/data"], &wasm_scalar_answer(), "")?;
+    std::fs::write(
+        dir.join("spatial.wit"),
+        "package cf:gis@0.1.0; world spatial-file { export answer: func() -> u32; }",
+    )?;
+    bind_test_capabilities(&dir, &["cf:answer@1"])?;
+    let caf = sp(&build_to_caf(&dir)?);
+    cli(&["caf-tool", "run", &caf, "--fn", "answer"])?;
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn content_key_for_combinations() -> Result<()> {
+    let dir = temp_root("content-key")?;
+    write_config(&dir, &["/data"])?;
+    let caf = build_to_caf(&dir)?;
+    assert!(crate::content_key_for(&caf, &None, &None)?.is_none());
+    let key = Some("00".repeat(32));
+    assert!(crate::content_key_for(&caf, &key, &None)?.is_some());
+    assert!(crate::content_key_for(&caf, &Some("zz".into()), &None).is_err());
+    assert!(crate::content_key_for(&caf, &key, &Some("11".repeat(32))).is_err());
+    // A recipient key cannot unwrap an artifact without a keybox.
+    assert!(crate::content_key_for(&caf, &None, &Some("11".repeat(32))).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn trust_store_rejects_missing_and_malformed_files() -> Result<()> {
+    let dir = temp_root("trust-errors")?;
+    assert!(crate::TrustStore::load(&dir.join("missing.toml")).is_err());
+    std::fs::write(dir.join("bad.toml"), "not [valid")?;
+    assert!(crate::TrustStore::load(&dir.join("bad.toml")).is_err());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
+fn extract_exports_covers_component_model_binaries() -> Result<()> {
+    // A real component: encode the scalar module against a WIT world.
+    let mut resolve = wit_parser::Resolve::new();
+    let pkg = resolve.push_str(
+        "answer.wit",
+        "package cf:demo@0.1.0; world w { export answer: func() -> u32; }",
+    )?;
+    let world = resolve.select_world(&[pkg], Some("w"))?;
+    let mut core = wasm_scalar_answer();
+    wit_component::embed_component_metadata(
+        &mut core,
+        &resolve,
+        world,
+        wit_component::StringEncoding::UTF8,
+        false,
+    )?;
+    let component = wit_component::ComponentEncoder::default()
+        .module(&core)?
+        .encode()?;
+    let exports = crate::exports::extract_exports(&component);
+    assert!(
+        exports
+            .iter()
+            .any(|e| e.export == "answer" && e.signature == "func"),
+        "{exports:?}"
+    );
+    Ok(())
+}
