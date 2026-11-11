@@ -18,7 +18,10 @@ pub const EXPORT_FORMAT_MIN: u64 = 1;
 /// the ZIP bytes depend on — see `doc/spec/round-trip.md` §3).
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum Compression {
+    /// Deflate-compressed entries (default; smaller archives).
     Deflate,
+    /// Uncompressed entries; ZIP bytes then depend only on the pinned zip
+    /// writer, not on a deflate implementation.
     Stored,
 }
 
@@ -31,6 +34,9 @@ impl Compression {
     }
 }
 
+/// Export a CAF's stored contents to the ZIP at `output`
+/// (`doc/spec/round-trip.md` §3). `force` replaces an existing output; sealed
+/// artifacts require `key` or `recipient`, and the ZIP then holds plaintext.
 pub fn export(
     input: &Path,
     output: &Path,

@@ -15,6 +15,8 @@
 //! read (backing-store accounting), and output (emit/log plus the return
 //! channel: result values and bytes the host pulls out of guest memory).
 
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

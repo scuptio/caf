@@ -11,6 +11,10 @@ use zip::ZipArchive;
 
 use crate::export::{EXPORT_FORMAT_CURRENT, EXPORT_FORMAT_MIN};
 
+/// Rebuild a byte-identical plaintext `.caf` at `output` from an export ZIP.
+/// Every entry is verified against the preserved manifest, and the rebuild is
+/// published only after the recomputed root hash matches and the artifact
+/// passes strict verification. `force` replaces an existing output.
 pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     if let Ok(target) = output.canonicalize() {
         ensure!(

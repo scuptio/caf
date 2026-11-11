@@ -1,6 +1,8 @@
 //! Shared CAF container parsing and verification, used by both the build tool
 //! (`caf-tool`) and the host runtime (`caf-runtime`).
 
+#![warn(missing_docs)]
+
 pub mod crypto;
 pub mod hex;
 pub mod identity;

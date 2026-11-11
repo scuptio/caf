@@ -12,6 +12,8 @@
 //!   dimensions the Wasm engine does not enforce itself (read, output). Every
 //!   charge is monotone: budgets only shrink.
 
+#![warn(missing_docs)]
+
 use caf_core::manifest::{CapabilityPolicy, ExecutionProfile, ResourceLimits};
 
 /// Host function groups of the `caf` ABI, classified by the capability they

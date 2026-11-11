@@ -6,6 +6,8 @@
 //! `cdylib` component built for `wasm32-unknown-unknown`; on any other target
 //! it compiles but the host imports are never linked.
 
+#![warn(missing_docs)]
+
 // ---------------------------------------------------------------------------
 // Host ABI: a minimal, read-only payload filesystem plus meta I/O. The host
 // (native runtime or browser) implements these against the .caf file; the

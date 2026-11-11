@@ -16,15 +16,20 @@ pub struct Wit {
 pub struct WorldExport {
     /// Kebab-name of the export (matches the capability `name`, e.g. `spatial-query`).
     pub name: String,
+    /// The functions this export groups (one for a freestanding function).
     pub functions: Vec<FunctionExport>,
 }
 
+/// One function inside a world export, with its caf-abi signature.
 pub struct FunctionExport {
+    /// WIT function name (kebab-case).
     pub name: String,
+    /// caf-abi signature string (as recorded in the manifest).
     pub signature: String,
     /// Whether the signature needs the caf-abi memory bridge (complex
     /// params/results — anything beyond scalars).
     pub needs_bridge: bool,
+    /// The lowered core WASM function type.
     pub core_type: wasmparser::FuncType,
 }
 

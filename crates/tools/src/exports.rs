@@ -74,10 +74,14 @@ fn component_kind(kind: ComponentExternalKind) -> &'static str {
 
 /// Validated v1 core exports, retaining the real export name for invocation.
 pub struct CoreExports {
+    /// Kebab-case name → (raw WASM export name, function type).
     pub functions: std::collections::HashMap<String, (String, wasmparser::FuncType)>,
+    /// True when the exported `memory` is a 32-bit, unshared memory.
     pub memory32: bool,
 }
 
+/// Validate a core module and enumerate its exports with function types.
+/// Component-model binaries are rejected (format v1 embeds core modules).
 pub fn core_exports(wasm: &[u8]) -> anyhow::Result<CoreExports> {
     use anyhow::{Context, bail};
     use wasmparser::{Encoding, TypeRef, Validator};

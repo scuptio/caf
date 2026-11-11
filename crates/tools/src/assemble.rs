@@ -29,8 +29,11 @@ use crate::config::{Config, EncryptConfig};
 use crate::exports;
 use crate::wit;
 
+/// The result of assembling an artifact.
 pub struct BuildOutput {
+    /// The complete `.caf` bytes.
     pub bytes: Vec<u8>,
+    /// The plaintext-shaped manifest view (for `--dump-manifest` records).
     pub manifest: Manifest,
     /// Sealed builds only: the public envelope manifest section.
     pub envelope: Option<Envelope>,
@@ -43,6 +46,9 @@ pub struct BuildOutput {
     pub content_key: Option<[u8; 32]>,
 }
 
+/// Assemble a `.caf` artifact from a validated build config. The build is
+/// deterministic (`doc/spec/round-trip.md` §2); only supported
+/// `format_version`s are accepted (fail-closed).
 pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     // Only write format versions this build can also read (fail-closed).
     caf_core::version::spec(cfg.format_version)

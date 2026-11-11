@@ -6,18 +6,27 @@ use askama::Template;
 use clap::ValueEnum;
 use std::path::Path;
 
+/// Project skeleton languages for `caf-tool new`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Language {
+    /// Rust (cargo build to wasm32-unknown-unknown).
     Rust,
+    /// Python (componentize-py).
     Python,
+    /// JavaScript (ComponentizeJS).
     #[value(name = "js", alias = "javascript")]
     JavaScript,
+    /// Go via TinyGo.
     #[value(name = "go", alias = "tinygo")]
     TinyGo,
+    /// ActionScript (asc).
     #[value(name = "as", alias = "actionscript")]
     ActionScript,
 }
 
+/// Create the project `dir/name`: `build.toml`, a WIT interface, a payload
+/// directory, and a language skeleton. Fails on invalid names or when the
+/// directory already exists.
 pub fn scaffold(name: &str, lang: Language, dir: &Path) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         bail!("invalid project name '{name}'");
