@@ -283,6 +283,9 @@ pub fn read_header(bytes: &[u8]) -> Result<Header> {
     if flags & !KNOWN_FLAGS != 0 {
         bail!("unknown header flags 0x{flags:04x} (known mask 0x{KNOWN_FLAGS:04x})");
     }
+    // Version admission is fail-closed at the header, before any further
+    // parsing (doc/spec/container-format.md §12).
+    crate::version::spec(format_version)?;
     if header_size != HEADER_SIZE as u16 {
         bail!("unsupported header size {header_size}");
     }

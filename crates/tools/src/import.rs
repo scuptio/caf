@@ -4,10 +4,12 @@
 //! is published only after the recomputed root hash matches `export.json` and
 //! the reconstructed artifact passes strict verification.
 use anyhow::{Context, Result, ensure};
-use caf_core::{hex, identity, layout, manifest, payload, verify};
+use caf_core::{hex, identity, layout, payload, verify, version};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, io::Read, path::Path};
 use zip::ZipArchive;
+
+use crate::export::{EXPORT_FORMAT_CURRENT, EXPORT_FORMAT_MIN};
 
 pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     if let Ok(target) = output.canonicalize() {
@@ -27,12 +29,12 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     let meta_bytes = read_entry(&mut zip, "export.json")?;
     let meta: serde_json::Value =
         serde_json::from_slice(&meta_bytes).context("parse export.json")?;
-    let version = meta["export_version"]
+    let export_version = meta["export_version"]
         .as_u64()
         .context("export.json: missing export_version")?;
     ensure!(
-        (1..=2).contains(&version),
-        "unsupported export_version {version}"
+        (EXPORT_FORMAT_MIN..=EXPORT_FORMAT_CURRENT).contains(&export_version),
+        "unsupported export_version {export_version}"
     );
     ensure!(
         meta["source_encrypted"] == false,
@@ -41,15 +43,14 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     );
 
     // manifest.cbor: the sole ordering authority (components, payload DFS).
+    // export_version 1 archives predate the format_version field; only
+    // container format v1 existed then.
     let manifest_bytes = read_entry(&mut zip, "manifest.cbor")?;
-    let manifest: manifest::Manifest =
-        ciborium::de::from_reader(manifest_bytes.as_slice()).context("parse manifest.cbor")?;
-    if let Some(v) = meta["format_version"].as_u64() {
-        ensure!(
-            v == manifest.format_version as u64,
-            "export.json format_version does not match the manifest"
-        );
-    }
+    let declared = match meta["format_version"].as_u64() {
+        Some(v) => u32::try_from(v).context("export.json format_version out of range")?,
+        None => version::V1.version,
+    };
+    let manifest = version::load_manifest(&manifest_bytes, declared)?;
     let manifest_hash = sha256(&manifest_bytes);
 
     // Interface section.

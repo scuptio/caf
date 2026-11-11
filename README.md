@@ -171,5 +171,10 @@ a WASM component, and a payload in multiple open formats — see
   verification, trust model, versioning).
 - [`doc/spec/caf-abi.md`](doc/spec/caf-abi.md) — the value-encoding ABI: how
   complex values cross the host↔component boundary in format v1.
+- [`doc/spec/round-trip.md`](doc/spec/round-trip.md) — deterministic
+  round-trip rules: reproducible build, ZIP export, byte-identical import.
+- [`doc/spec/versioning.md`](doc/spec/versioning.md) — the maintainer upgrade
+  guide: version axes, when a bump is required, the per-version folder
+  procedure.
 - [`examples/gis-demo/gis-profile.md`](examples/gis-demo/gis-profile.md) — an example profile
   layered on top of the generic container.

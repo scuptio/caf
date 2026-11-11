@@ -44,6 +44,9 @@ pub struct BuildOutput {
 }
 
 pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
+    // Only write format versions this build can also read (fail-closed).
+    caf_core::version::spec(cfg.format_version)
+        .with_context(|| format!("unsupported format_version {}", cfg.format_version))?;
     let prepared = prepare(cfg, base)?;
     if let Some(encrypt) = &cfg.encrypt {
         assemble_sealed(cfg, &prepared, encrypt)

@@ -139,7 +139,7 @@ pub struct SignConfig {
 }
 
 fn default_format_version() -> u32 {
-    1
+    caf_core::version::CURRENT.version
 }
 
 fn default_media_type() -> String {

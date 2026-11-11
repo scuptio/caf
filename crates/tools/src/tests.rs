@@ -1866,3 +1866,46 @@ fn export_stored_compression_is_byte_deterministic() -> Result<()> {
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Format version registry (caf_core::version): admission is fail-closed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unsupported_format_version_is_rejected_at_the_header() -> Result<()> {
+    let dir = temp_root("version-admission")?;
+    write_config(&dir, &["/data"])?;
+    let mut bytes = build_bytes(&dir)?;
+    assert_eq!(layout::read_header(&bytes)?.format_version, 1);
+
+    // Bump the declared container version to something this build never heard of.
+    bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+    let err = layout::read_header(&bytes)
+        .err()
+        .context("unknown version must fail")?;
+    assert!(
+        format!("{err:#}").contains("unsupported format version 2"),
+        "{err:#}"
+    );
+    assert!(verify::verify_bytes(&bytes).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn build_rejects_unsupported_format_version() -> Result<()> {
+    let dir = temp_root("version-build")?;
+    write_config(&dir, &["/data"])?;
+    let (mut cfg, base) = config::load(&dir.join("build.toml"))?;
+    cfg.format_version = 2;
+    let err = assemble::assemble(&cfg, &base)
+        .err()
+        .context("unsupported version must fail")?;
+    assert!(
+        format!("{err:#}").contains("unsupported format_version 2"),
+        "{err:#}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

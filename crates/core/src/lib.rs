@@ -8,3 +8,4 @@ pub mod layout;
 pub mod manifest;
 pub mod payload;
 pub mod verify;
+pub mod version;

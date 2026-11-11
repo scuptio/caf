@@ -1,12 +1,17 @@
 //! Transactional, deterministic ZIP export of a CAF's stored contents.
 use anyhow::{Context, Result, bail, ensure};
-use caf_core::{crypto, hex, layout, manifest, payload};
+use caf_core::{crypto, hex, layout, manifest, payload, version};
 use caf_runtime::{ArtifactContents, FileSource, PayloadSource};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, io::Write, path::Path, sync::Arc};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 const BLOCK: u64 = manifest::CHUNK_SIZE as u64;
+
+/// export.json schema version written by this build (`doc/spec/round-trip.md` §3).
+pub const EXPORT_FORMAT_CURRENT: u64 = 2;
+/// Oldest export.json schema version `import` accepts.
+pub const EXPORT_FORMAT_MIN: u64 = 1;
 
 /// ZIP compression mode for `export`: `deflate` (default) or `stored`
 /// (uncompressed; removes the deflate implementation from the set of inputs
@@ -140,7 +145,7 @@ pub fn export(
     let manifest_bytes = source.read_at(header.manifest_offset, header.manifest_len)?;
     add(&mut zip, "manifest.cbor", &manifest_bytes, compression)?;
     let json = if sealed {
-        let envelope: manifest::Envelope = ciborium::de::from_reader(manifest_bytes.as_slice())?;
+        let envelope = version::load_envelope(&manifest_bytes, header.format_version)?;
         let entry = entries
             .iter()
             .find(|e| e.tag == layout::TAG_PRIVATE)
@@ -230,7 +235,7 @@ pub fn export(
         &mut zip,
         "export.json",
         &serde_json::to_vec_pretty(&serde_json::json!({
-            "export_version": 2,
+            "export_version": EXPORT_FORMAT_CURRENT,
             "root_hash": artifact.root_hash(),
             "source_encrypted": sealed,
             "format_version": header.format_version,

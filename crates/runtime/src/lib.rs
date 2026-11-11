@@ -278,15 +278,7 @@ impl Artifact {
         if manifest_entry.hash != decode_hash(&manifest_hash)? {
             bail!("manifest hash mismatch");
         }
-        let manifest: manifest::Manifest =
-            ciborium::de::from_reader(manifest_bytes.as_slice()).context("decode manifest")?;
-        if header.format_version != manifest.format_version {
-            bail!(
-                "format version mismatch: header {}, manifest {}",
-                header.format_version,
-                manifest.format_version
-            );
-        }
+        let manifest = caf_core::version::load_manifest(&manifest_bytes, header.format_version)?;
 
         // The interface is pinned by the manifest.
         let interface_bytes = source.read_at(header.interface_offset, header.interface_len)?;
@@ -433,18 +425,11 @@ impl Artifact {
         let directory_bytes = source.read_at(header.directory_offset, header.directory_len)?;
         let directory = layout::decode_directory(&directory_bytes)?;
 
-        let envelope: manifest::Envelope =
-            ciborium::de::from_reader(envelope_bytes.as_slice()).context("decode envelope")?;
-        if header.format_version != envelope.format_version {
-            bail!(
-                "format version mismatch: header {}, envelope {}",
-                header.format_version,
-                envelope.format_version
-            );
-        }
-        if envelope.encryption.aead != manifest::AeadAlgorithm::Aes256Gcm
-            || envelope.encryption.wrap != manifest::KeyWrapAlgorithm::P256EcdhSha256
-            || envelope.encryption.padding != manifest::PaddingProfile::Pow2
+        let envelope = caf_core::version::load_envelope(&envelope_bytes, header.format_version)?;
+        let crypto = &caf_core::version::spec(header.format_version)?.crypto;
+        if envelope.encryption.aead != crypto.aead
+            || envelope.encryption.wrap != crypto.wrap
+            || envelope.encryption.padding != crypto.padding
         {
             bail!("unsupported encryption parameters");
         }

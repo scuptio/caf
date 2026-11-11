@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use caf_core::{crypto, hex, layout, manifest, payload, verify};
+use caf_core::{crypto, hex, layout, payload, verify, version};
 use caf_runtime::{Artifact, FileSource};
 
 mod assemble;
@@ -361,7 +361,7 @@ fn main() -> Result<()> {
             }
             let manifest_bytes =
                 layout::slice(&bytes, header.manifest_offset, header.manifest_len)?;
-            let manifest: manifest::Manifest = ciborium::de::from_reader(manifest_bytes)?;
+            let manifest = version::load_manifest(manifest_bytes, header.format_version)?;
             println!("name:          {}", manifest.name);
             println!("version:       {}", manifest.version);
             println!("format:        {}", manifest.format_version);
@@ -575,7 +575,7 @@ fn inspect_sealed(
     content_key: Option<[u8; 32]>,
 ) -> Result<()> {
     let envelope_bytes = layout::slice(bytes, header.manifest_offset, header.manifest_len)?;
-    let envelope: manifest::Envelope = ciborium::de::from_reader(envelope_bytes)?;
+    let envelope = version::load_envelope(envelope_bytes, header.format_version)?;
     println!("sealed:        aes-256-gcm (names, provenance and the payload tree are encrypted)");
     println!("format:        {}", envelope.format_version);
     println!("root hash:     {}", hex::encode(&header.root_hash));

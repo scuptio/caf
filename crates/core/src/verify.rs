@@ -122,17 +122,8 @@ fn verify_plaintext(
     let manifest_bytes = layout::slice(bytes, header.manifest_offset, header.manifest_len)?;
     let interface_bytes = layout::slice(bytes, header.interface_offset, header.interface_len)?;
 
-    let manifest: Manifest =
-        ciborium::de::from_reader(manifest_bytes).context("decode manifest")?;
-
-    // 0. Header/manifest version consistency.
-    if header.format_version != manifest.format_version {
-        bail!(
-            "format version mismatch: header {}, manifest {}",
-            header.format_version,
-            manifest.format_version
-        );
-    }
+    // 0. Version admission, schema migration and header consistency.
+    let manifest = crate::version::load_manifest(manifest_bytes, header.format_version)?;
 
     // 1. Manifest hash (over the exact manifest bytes in the file).
     let manifest_hash = sha256_hex(manifest_bytes);
@@ -257,19 +248,12 @@ fn verify_sealed(
 ) -> Result<VerifyReport> {
     let envelope_bytes = layout::slice(bytes, header.manifest_offset, header.manifest_len)?;
     let interface_bytes = layout::slice(bytes, header.interface_offset, header.interface_len)?;
-    let envelope: Envelope =
-        ciborium::de::from_reader(envelope_bytes).context("decode envelope manifest")?;
+    let envelope = crate::version::load_envelope(envelope_bytes, header.format_version)?;
 
-    if header.format_version != envelope.format_version {
-        bail!(
-            "format version mismatch: header {}, envelope {}",
-            header.format_version,
-            envelope.format_version
-        );
-    }
-    if envelope.encryption.aead != AeadAlgorithm::Aes256Gcm
-        || envelope.encryption.wrap != KeyWrapAlgorithm::P256EcdhSha256
-        || envelope.encryption.padding != PaddingProfile::Pow2
+    let crypto = &crate::version::spec(header.format_version)?.crypto;
+    if envelope.encryption.aead != crypto.aead
+        || envelope.encryption.wrap != crypto.wrap
+        || envelope.encryption.padding != crypto.padding
     {
         bail!("unsupported encryption parameters");
     }

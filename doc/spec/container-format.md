@@ -583,6 +583,9 @@ size, and no format change required.
 
 - `format_version` (header + manifest) is the container contract. v1 readers
   reject a higher major version at the header, before any further parsing.
+  The supported set, per-version parameters, and schema migrations are
+  maintained in `crates/core/src/version/` (one folder per version) — nowhere
+  else. The maintainer procedure is `doc/spec/versioning.md`.
 - Readers reject unknown header flag bits, unknown directory tags, and unknown
   manifest fields (fail-closed). Consequently any new flag, tag, or manifest
   field — e.g. a future AEAD revision — is a *major* change: it ships with a
