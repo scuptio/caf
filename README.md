@@ -2,7 +2,7 @@
 
 > English | [简体中文](README.zh-CN.md) · License: [Apache-2.0](LICENSE)
 
-[![CI](https://github.com/ybbh/caf/actions/workflows/ci.yml/badge.svg)](https://github.com/ybbh/caf/actions/workflows/ci.yml)
+[![CI](https://github.com/scuptio/caf/actions/workflows/ci.yml/badge.svg)](https://github.com/scuptio/caf/actions/workflows/ci.yml)
 
 A Rust workspace implementing the **Computable Artifact Format (`.caf`)** — a
 general, domain-agnostic way to ship *data together with the computation that
@@ -102,9 +102,9 @@ layout, and the reconstruction guarantees are specified in
 
 ## Ecosystem
 
-- [CAFDReader](https://github.com/ybbh/CAFDReader) — the cross-platform reader for
+- [CAFDReader](https://github.com/scuptio/CAFDReader) — the cross-platform reader for
   CAFD (`.cafd`) interactive documents, a document profile built on the CAF
-  container ([CAFD 1.0.0 spec](https://github.com/ybbh/CAFDReader/blob/main/spec/en/CAFD.md)).
+  container ([CAFD 1.0.0 spec](https://github.com/scuptio/CAFDReader/blob/main/spec/en/CAFD.md)).
 
 ## Documentation
 

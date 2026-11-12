@@ -2,7 +2,7 @@
 
 > [English](README.md) | 简体中文 · 许可证:[Apache-2.0](LICENSE)
 
-[![CI](https://github.com/ybbh/caf/actions/workflows/ci.yml/badge.svg)](https://github.com/ybbh/caf/actions/workflows/ci.yml)
+[![CI](https://github.com/scuptio/caf/actions/workflows/ci.yml/badge.svg)](https://github.com/scuptio/caf/actions/workflows/ci.yml)
 
 一个实现**可计算构件格式(`.caf`)** 的 Rust 工作区——一种把*数据和操作数据
 的计算一起交付*的通用、领域无关方式。
@@ -95,9 +95,9 @@ caf-tool versions                    # 受支持的容器格式版本
 
 ## 生态
 
-- [CAFDReader](https://github.com/ybbh/CAFDReader) —— CAFD(`.cafd`)交互文档的跨平台
+- [CAFDReader](https://github.com/scuptio/CAFDReader) —— CAFD(`.cafd`)交互文档的跨平台
   阅读器;CAFD 是建立在 CAF 容器之上的文档
-  profile([CAFD 1.0.0 规范](https://github.com/ybbh/CAFDReader/blob/main/spec/zh-CN/CAFD.md))。
+  profile([CAFD 1.0.0 规范](https://github.com/scuptio/CAFDReader/blob/main/spec/zh-CN/CAFD.md))。
 
 ## 文档
 
