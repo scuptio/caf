@@ -2,7 +2,7 @@
 
 > English | [简体中文](../zh-CN/caf-abi.md)
 
-Status: draft · applies to container format v1 (core-module execution).
+Status: draft — **unstable** · applies to container format v1 (core-module execution).
 
 The container spec ([`container-format.md`](container-format.md)) fixes how
 bytes are laid out and verified; this document fixes how **values** cross the

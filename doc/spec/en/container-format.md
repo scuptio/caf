@@ -2,7 +2,7 @@
 
 > English | [简体中文](../zh-CN/container-format.md)
 
-Version: **0.1.0** · Status: draft
+Version: **1.0.0-draft.1** · Status: draft — **unstable**: the byte layout may change before 1.0.0
 
 A `.caf` file is a **Computable Artifact**: a single, immutable, range-readable,
 content-addressed container that carries data *and* the portable computation
@@ -615,7 +615,7 @@ size, and no format change required.
   manifest fields (fail-closed). Consequently any new flag, tag, or manifest
   field — e.g. a future AEAD revision — is a *major* change: it ships with a
   `format_version` bump, never silently ignored by an old reader.
-- While the format is at draft stage (`0.1.x`), byte layout may change between
+- While the format is at draft stage (`1.0.0-draft.x`), byte layout may change between
   releases with a `format_version` bump; no compatibility guarantee is made.
 - Starting with the first stable tag (`1.0`): readers accept all artifacts of
   the same major version; a reader rejects only *higher* major versions.
