@@ -1,5 +1,7 @@
 # Deterministic Round-Trip: `project → .caf ⇄ .zip` — Specification
 
+> English | [简体中文](../zh-CN/round-trip.md)
+
 This document is the normative contract for rebuilding a `.caf` artifact
 byte-for-byte: from its project sources (reproducible build), and from its
 export ZIP (reconstruction). It complements `container-format.md` (the byte

@@ -1,47 +1,57 @@
 # CAF GIS Demo
 
-一个纯前端的 **可计算空间工件（Computable Spatial Artifact）** 演示：把空间数据、接口定义与可移植计算（WASM 组件）打包进单个 `.caf` 文件，浏览器直接解析并在本地执行，**无后端、无插件**。
+> English | [简体中文](README.zh-CN.md)
 
-> 核心思想：**不再交付 GIS 数据，而是交付空间能力。** 浏览器只看到 `.caf` 这个不透明容器，至于里面是 GeoJSON 还是 WKB、如何解析，全部由内嵌的 WASM 组件决定。
+A pure-frontend **Computable Spatial Artifact** demo: spatial data, interface
+definitions, and portable computation (a WASM component) are packed into a single
+`.caf` file, which the browser parses and executes locally — **no backend, no
+plugins**.
 
-这个 demo 本身就是一个「用 `caf-tool new` 脚手架出来、再填上真实计算」的项目。下面先讲**如何从零一步步搭出来**，再看它最终长什么样。
+> Core idea: **stop shipping GIS data; ship spatial capabilities.** The browser
+> only sees the opaque `.caf` container; whether the payload is GeoJSON or WKB and
+> how to parse it is entirely up to the embedded WASM component.
 
-## Step by step：从空项目到 `.caf`
+This demo is itself a project that was scaffolded with `caf-tool new` and then
+filled with real computation. Below we first walk through **how to build it from
+scratch, step by step**, then look at what the final artifact looks like.
 
-先确保 `caf-tool` 在 `PATH` 上（或直接用 `cargo run -p caf-tool -- ...`）：
+## Step by step: from an empty project to a `.caf`
+
+Make sure `caf-tool` is on your `PATH` (or just use `cargo run -p caf-tool -- ...`):
 
 ```bash
-cargo install --path crates/tools
+cargo make install
 ```
 
-### 0. 用 wizard 生成空项目
+### 0. Generate the empty project with the wizard
 
 ```bash
 caf-tool new gis-demo --lang rust
 cd gis-demo
 ```
 
-生成：
+Generated:
 
 ```text
 gis-demo/
-├── build.toml              # caf-tool 打包配置（通用骨架）
+├── build.toml              # caf-tool packaging config (generic skeleton)
 ├── build.sh
-├── Cargo.toml              # Rust crate（通用骨架）
-├── interfaces/gis-demo.wit # 占位接口（一个 ping()）
-├── src/lib.rs              # 最小组件（一个 ping()）
-└── payload/                # 空 payload
+├── Cargo.toml              # Rust crate (generic skeleton)
+├── interfaces/gis-demo.wit # placeholder interface (a single ping())
+├── src/lib.rs              # minimal component (a single ping())
+└── payload/                # empty payload
 ```
 
-### 1. 定义接口（WIT）
+### 1. Define the interface (WIT)
 
-把占位接口重命名，并替换成空间能力 `spatial-transform`：
+Rename the placeholder interface and replace it with the spatial capability
+`spatial-transform`:
 
 ```bash
 mv interfaces/gis-demo.wit interfaces/gis.wit
 ```
 
-`interfaces/gis.wit`：
+`interfaces/gis.wit`:
 
 ```wit
 package cf:gis@0.1.0;
@@ -56,17 +66,17 @@ world projection {
 }
 ```
 
-### 2. 实现计算（`src/lib.rs`）
+### 2. Implement the computation (`src/lib.rs`)
 
-把 `src/lib.rs` 里的占位 `ping()` 换成真正的投影 + 要素解析代码（见本仓库的
-`src/lib.rs`）。它通过只读的 `payload-fs` 宿主 ABI（`open`/`read`/`readdir`/`close`）
-读取 payload，并导出 `features()`、`features_from_file()`、`reproject_x()`、
-`reproject_y()`。
+Replace the placeholder `ping()` in `src/lib.rs` with real projection + feature
+parsing code (see this repo's `src/lib.rs`). It reads the payload through the
+read-only `payload-fs` host ABI (`open`/`read`/`readdir`/`close`) and exports
+`features()`, `features_from_file()`, `reproject_x()`, `reproject_y()`.
 
-### 3. 让打包配置指向真正的组件
+### 3. Point the packaging config at the real component
 
-改 `build.toml`：组件名、world、capabilities 与接口对齐（`path` 保持 wizard 默认
-的 `gis-demo.wasm` 即可）：
+Edit `build.toml`: align the component name, world, and capabilities with the
+interface (keep the wizard's default `gis-demo.wasm` for `path`):
 
 ```toml
 interfaces = ["interfaces/gis.wit"]
@@ -79,41 +89,44 @@ capabilities = ["cf:spatial-transform@1"]
 access = []
 ```
 
-### 4. 放入 payload 数据
+### 4. Add payload data
 
-把源 GeoJSON 放进 `payload/data/`，跑 `make_data.py` 生成第二种开放格式（WKB）：
+Put the source GeoJSON into `payload/data/`, then run `make_data.py` to generate
+the second open format (WKB):
 
 ```bash
 python3 make_data.py
 ```
 
-### 5. 构建 `.caf`
+### 5. Build the `.caf`
 
 ```bash
 ./build.sh
-# 或手动：
+# or manually:
 cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/gis_demo.wasm ./gis-demo.wasm
 caf-tool build -c build.toml -o demo.caf
 ```
 
-`caf-tool` 会用 `wit-parser` 校验 WIT，把 `cf:spatial-transform@1` 绑定到 world 的
-`spatial-transform` 导出，再把数据 + 接口 + wasm + 策略 + 身份打成单个 `demo.caf`。
+`caf-tool` validates the WIT with `wit-parser`, binds `cf:spatial-transform@1` to
+the world's `spatial-transform` export, and packs data + interface + wasm + policy
++ identity into a single `demo.caf`.
 
-### 6. 校验与查看
+### 6. Verify and inspect
 
 ```bash
 caf-tool verify demo.caf
 caf-tool inspect demo.caf
 ```
 
-`inspect` 会显示 capability 徽章、组件导出（`reproject`）、access scope 与 payload
-文件清单。
+`inspect` shows the capability badges, the component exports (`reproject`), the
+access scopes, and the payload file listing.
 
-### 7. 执行能力（caf-runtime）
+### 7. Execute a capability (caf-runtime)
 
-`caf-runtime` 会校验工件、实例化组件，并强制 `payload-fs` 只读 ABI + 能力策略 +
-fuel 限额，然后调用组件函数：
+`caf-runtime` verifies the artifact, instantiates the component, enforces the
+read-only `payload-fs` ABI + capability policy + fuel limits, then calls the
+component function:
 
 ```bash
 caf-tool run demo.caf --fn reproject_x --args 120,30,4326,3857
@@ -124,119 +137,155 @@ caf-tool run demo.caf --fn features
 #     (string) {"crs":"EPSG:4326","features":[...]}
 ```
 
-## 目录结构
+## Directory layout
 
 ```
 gis-demo/
-├── build.sh              # 一键构建：编译 WASM → 生成数据 → 打包 .caf
-├── build.toml            # caf-tool 打包配置（名称、接口、payload、组件）
-├── Cargo.toml            # Rust crate（cdylib → wasm32-unknown-unknown）
-├── make_data.py          # 将 global.geo.json 转换为第二种开放格式 WKB
-├── interfaces/gis.wit    # WIT 接口：spatial-transform（reproject 能力）
-├── src/lib.rs            # 数据解析 + 坐标投影（编译为 wasm 组件）
-├── payload/data/         # 源数据（打包进 .caf 的 payload）
-│   ├── global.geo.json   # GeoJSON / RFC 7946（全球国家边界 + 中国合规国界/九段线）
-│   └── global.wkb        # 由 .geo.json 转换生成的 WKB 流
-├── demo.caf              # 打包产物（最终交付的单一文件）
-└── web/                  # 浏览器演示（静态页面 + CAF 宿主运行时）
+├── build.sh              # one-shot build: compile WASM → generate data → pack .caf
+├── build.toml            # caf-tool packaging config (name, interface, payload, components)
+├── Cargo.toml            # Rust crate (cdylib → wasm32-unknown-unknown)
+├── make_data.py          # converts global.geo.json into the second open format, WKB
+├── interfaces/gis.wit    # WIT interface: spatial-transform (reproject capability)
+├── src/lib.rs            # data parsing + coordinate projection (compiled to a wasm component)
+├── payload/data/         # source data (packed into the .caf payload)
+│   ├── global.geo.json   # GeoJSON / RFC 7946 (world country boundaries + China's standard boundary / nine-dash line)
+│   └── global.wkb        # WKB stream converted from the .geo.json
+├── demo.caf              # the packed artifact (the single deliverable file)
+└── web/                  # browser demo (static page + CAF host runtime)
     ├── index.html
-    ├── caf.js            # CAF 容器解析 + 分块懒校验 + payload-fs 宿主 ABI + WASM 实例化
-    ├── app.js            # 渲染 / 交互
-    ├── caf.test.mjs      # Node 冒烟测试（三种加载路径）
-    └── demo.caf          # 手动放入 web/ 以供静态托管
+    ├── caf.js            # CAF container parsing + chunked lazy verification + payload-fs host ABI + WASM instantiation
+    ├── app.js            # rendering / interaction
+    ├── caf.test.mjs      # Node smoke test (three loading paths)
+    └── demo.caf          # manually copied into web/ for static hosting
 ```
 
-## 快速开始（直接跑 demo）
+## Quick start (run the demo directly)
 
 ```bash
-# 1.（可选）重新构建 .caf（已改动 src/lib.rs / 接口 / 数据时）
+# 1. (optional) rebuild the .caf (after changing src/lib.rs / the interface / data)
 cd examples/gis-demo
 bash build.sh
 
-# 2. 静态托管 web/ 目录（必须在 web/ 内启动；demo.caf 需先拷入 web/）
+# 2. statically serve the web/ directory (must be started inside web/; demo.caf must be copied in first)
 cd web
 cp ../demo.caf .
 python3 -m http.server 8000
 
-# 3. 浏览器打开 http://localhost:8000
+# 3. open http://localhost:8000 in a browser
 ```
 
-打开后会自动加载 `demo.caf`；也可以点 "Open .caf file" 或拖入任意 `.caf` 文件。
+`demo.caf` loads automatically; you can also click "Open .caf file" or drag in any
+`.caf` file.
 
-**加载模式**（`caf.js` 自动选择）：
+**Loading modes** (chosen automatically by `caf.js`):
 
-- **Range + JSPI**：服务器支持 HTTP Range（nginx、CDN 等；`python3 -m http.server`
-  不支持）且浏览器支持 JSPI 时，工件按需分块读取——打开只取 boot 区与组件，
-  payload 分块 Merkle 校验后懒加载，信息面板可见实际读取字节数。
-- **整文件回退**：无 Range 或 JSPI 时一次 GET 下载全文件，随后分块懒校验
-  （语义相同，只是字节已全量落地）。
-- **本地文件**：拖入/选择 `.caf` 文件（`file://` 直接双击 index.html 时
-  `fetch("demo.caf")` 会失败，属浏览器限制，手动打开即可）。
+- **Range + JSPI**: when the server supports HTTP Range (nginx, CDN, etc.;
+  `python3 -m http.server` does not) and the browser supports JSPI, the artifact is
+  read in chunks on demand — opening fetches only the boot area and the components,
+  and payload chunks are Merkle-verified lazily; the info panel shows the actual
+  bytes read.
+- **Whole-file fallback**: without Range or JSPI, one GET downloads the whole file,
+  followed by chunked lazy verification (same semantics; the bytes are simply all
+  local already).
+- **Local file**: drag in or pick a `.caf` file (when index.html is opened directly
+  via `file://`, `fetch("demo.caf")` fails — a browser restriction; open the file
+  manually instead).
 
-无后端时也可用 Node 直接冒烟测试宿主运行时：
+Without a backend you can also smoke-test the host runtime with Node directly:
 
 ```bash
 cargo build -p caf-tool
 PATH="$PWD/target/debug:$PATH" bash examples/gis-demo/build.sh
-node examples/gis-demo/web/caf.test.mjs   # 覆盖 整文件回退 / Range / 内存 / 跨宿主一致性
+node examples/gis-demo/web/caf.test.mjs   # covers whole-file fallback / Range / in-memory / cross-host consistency
 ```
 
-以上命令在仓库根目录执行，需要 Rust 的 `wasm32-unknown-unknown` target
-（`rustup target add wasm32-unknown-unknown`）。`build.sh` 会生成测试所需的
-`demo.caf`、`demo-sealed.caf` 和 `web/sealed-key.js`；这些构建步骤也由 CI 的
-`js-host` job 在运行 Node 测试前执行。
+Run these commands from the repository root; the Rust `wasm32-unknown-unknown`
+target is required (`rustup target add wasm32-unknown-unknown`). `build.sh`
+produces the `demo.caf`, `demo-sealed.caf`, and `web/sealed-key.js` needed by the
+tests; the CI `js-host` job runs the same build steps before the Node tests.
 
-> 不可信工件可用 Worker 模式运行（`CAF.openCafWorker(...)`）：组件跑在 Web
-> Worker 中，主线程看门狗超时即终止——这是对 CPU/内存失控的尽力兜底（JS 宿主
-> 无法做指令级计量），渲染等热路径仍应使用可信工件的主线程模式。
+> Untrusted artifacts can be run in Worker mode (`CAF.openCafWorker(...)`): the
+> component runs inside a Web Worker and a main-thread watchdog terminates it on
+> timeout — a best-effort backstop against CPU/memory runaway (the JS host cannot
+> meter at instruction level); hot paths like rendering should still use
+> main-thread mode with trusted artifacts.
 
-## 数据与格式
+## Data and formats
 
-- `payload/data/global.geo.json`：全球国家边界（Polygon + MultiPolygon）+ 中国九段线（LineString）。
-- `payload/data/global.wkb`：由 `make_data.py` 从 `.geo.json` 转换生成的第二种开放格式（OGC WKB 几何，长度前缀流封装）。
+- `payload/data/global.geo.json`: world country boundaries (Polygon +
+  MultiPolygon) plus China's nine-dash line (LineString).
+- `payload/data/global.wkb`: the second open format converted from the `.geo.json`
+  by `make_data.py` (OGC WKB geometries in a length-prefixed stream).
 
-> 坐标为 5 位小数（约 1 米精度，远高于 Web 地图渲染需求），以降低体积与移动端内存占用。
+> Coordinates carry 5 decimal places (about 1 m precision, far beyond web-map
+> rendering needs) to keep size and mobile memory usage down.
 
-### 中国版图合规说明
+### China map compliance note
 
-数据集中的**中国国界与九段线**采用阿里云 DataV.GeoAtlas（`https://geo.datav.aliyun.com/areas_v3/bound/100000*.json`），其画法与自然资源部标准地图一致：
+The **China national boundary and nine-dash line** in this dataset come from
+Alibaba Cloud DataV.GeoAtlas
+(`https://geo.datav.aliyun.com/areas_v3/bound/100000*.json`), whose rendering is
+consistent with the standard maps of the Ministry of Natural Resources:
 
-- **台湾**、**香港**、**澳门**作为中国领土并入中国国界（已移除原先独立的 Taiwan / Hong Kong / Macao 要素）；
-- **藏南**、**阿克赛钦**按中国主张划入中国国界（印度国界已相应裁切）；
-- **南海诸岛**（西沙/南沙/曾母暗沙等）并入中国国界，并单独绘制**九段线**（`Nine-dash line 1..10` 要素）；
-- 移除了原先独立的 Spratly Is. / Scarborough Reef 要素。
+- **Taiwan**, **Hong Kong**, and **Macao** are merged into the China boundary as
+  Chinese territory (the previously separate Taiwan / Hong Kong / Macao features
+  have been removed);
+- **South Tibet** and **Aksai Chin** are included in the China boundary per China's
+  claim (the India boundary is clipped accordingly);
+- The **South China Sea islands** (Xisha/Nansha/Zengmu Ansha, etc.) are merged into
+  the China boundary, and the **nine-dash line** is drawn separately
+  (`Nine-dash line 1..10` features);
+- The previously separate Spratly Is. / Scarborough Reef features have been
+  removed.
 
-其余国家边界为 Natural Earth Admin-0 数据。
+All other country boundaries are Natural Earth Admin-0 data.
 
-> 提示：本演示仅用于展示 CAF 容器机制，若需正式发布/商用地图，应使用自然资源部"标准地图服务"并取得审图号。
+> Note: this demo only showcases the CAF container mechanism. For any official
+> release or commercial map use, use the Ministry of Natural Resources' "standard
+> map service" and obtain a map review number.
 
-同一份数据集以两种开放格式打包，WASM 组件通过**同一个 payload-fs 宿主 ABI**（`open`/`read`/`readdir`/`close`）读取并分别解析，再按名称去重——以此证明组件能读取任一载体，浏览器完全感知不到具体格式。
+The same dataset is packed in two open formats; the WASM component reads and parses
+both through **the same payload-fs host ABI** (`open`/`read`/`readdir`/`close`) and
+then de-duplicates by name — proving the component can read either carrier while
+the browser perceives no format at all.
 
-## 支持的投影
+## Supported projections
 
-`interfaces/gis.wit` 中的 `reproject(x, y, from-code, to-code)` 能力支持以下坐标参考系（球面，闭式或牛顿迭代公式，正反解均实现）：
+The `reproject(x, y, from-code, to-code)` capability in `interfaces/gis.wit`
+supports the following coordinate reference systems (spherical, closed-form or
+Newton-iteration formulas; both forward and inverse implemented):
 
-| 投影 | 代码 | 类型 |
+| Projection | Code | Type |
 |---|---|---|
-| WGS84 | 4326 | 经纬度（度） |
-| Web Mercator | 3857 | 圆柱 |
-| Equal Earth | 8857 | 等积伪圆柱 |
-| Mollweide | 54009 | 等积伪圆柱 |
-| Sinusoidal | 54008 | 等积伪圆柱 |
-| Hammer | 54044 | 等积（Hammer–Aitoff） |
-| Winkel I | 54045 | 折中 |
+| WGS84 | 4326 | geographic (degrees) |
+| Web Mercator | 3857 | cylindrical |
+| Equal Earth | 8857 | equal-area pseudocylindrical |
+| Mollweide | 54009 | equal-area pseudocylindrical |
+| Sinusoidal | 54008 | equal-area pseudocylindrical |
+| Hammer | 54044 | equal-area (Hammer–Aitoff) |
+| Winkel I | 54045 | compromise |
 
-`transform` 统一「经 4326 中转」，因此任意两个已支持投影之间均可互转。
+`transform` always routes through 4326, so any two supported projections can
+convert to each other.
 
-## 工作原理
+## How it works
 
-1. **CAF 容器**（`caf.js`）：解析文件头、canonical-CBOR manifest、payload 目录树与组件字节；payload 按 1 MiB 分块在读取时做 Merkle 校验（懒校验），支持 HTTP Range 按需取块。
-2. **宿主 ABI**：浏览器宿主向 WASM 组件暴露一个只读的 `payload-fs`（按路径读写，不暴露偏移/格式），并按 manifest 声明的策略做导入准入检查。
-3. **WASM 组件**（`src/lib.rs`）：实现 `features()`（遍历 `/data`、解析每种格式、返回规范化要素）与 `reproject_*`（坐标变换）。
-4. **渲染**（`app.js`）：把返回的要素按所选投影绘制到 canvas；小区域（< 3px）降级为点标记以免消失。
+1. **CAF container** (`caf.js`): parses the file header, the canonical-CBOR
+   manifest, the payload directory tree, and the component bytes; payload is
+   Merkle-verified lazily per 1 MiB chunk at read time, with HTTP Range on-demand
+   fetching.
+2. **Host ABI**: the browser host exposes a read-only `payload-fs` to the WASM
+   component (path-based reads; no offsets/formats exposed) and enforces import
+   admission per the policy declared in the manifest.
+3. **WASM component** (`src/lib.rs`): implements `features()` (walk `/data`, parse
+   each format, return normalized features) and `reproject_*` (coordinate
+   transforms).
+4. **Rendering** (`app.js`): draws the returned features onto a canvas in the
+   selected projection; tiny regions (< 3px) degrade to point markers so they do
+   not disappear.
 
-## 构建要求
+## Build requirements
 
-- Rust 工具链（含 `wasm32-unknown-unknown` target）
+- Rust toolchain (with the `wasm32-unknown-unknown` target)
 - Python 3
-- `caf-tool`（`caf/crates/tools`，`cargo install --path crates/tools` 安装）
+- `caf-tool` (`caf/crates/tools`; install with `cargo make install`)

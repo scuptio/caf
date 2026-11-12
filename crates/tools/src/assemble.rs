@@ -8,7 +8,7 @@
 //! payloads, and the private manifest are AES-256-GCM encrypted under a content
 //! key wrapped per recipient in the keybox section, each payload becomes a
 //! pow2-padded ciphertext blob, and the manifest section carries only the
-//! public envelope (see `doc/spec/container-format.md` §7).
+//! public envelope (see `doc/spec/en/container-format.md` §7).
 
 use anyhow::{Context, Result, bail};
 use rand_core::RngCore;
@@ -48,7 +48,7 @@ pub struct BuildOutput {
 }
 
 /// Assemble a `.caf` artifact from a validated build config. The build is
-/// deterministic (`doc/spec/round-trip.md` §2); only supported
+/// deterministic (`doc/spec/en/round-trip.md` §2); only supported
 /// `format_version`s are accepted (fail-closed).
 pub fn assemble(cfg: &Config, base: &Path) -> Result<BuildOutput> {
     // Only write format versions this build can also read (fail-closed).

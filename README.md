@@ -1,5 +1,9 @@
 # CAF — Computable Artifact Format
 
+> English | [简体中文](README.zh-CN.md) · License: [Apache-2.0](LICENSE)
+
+[![CI](https://github.com/ybbh/caf/actions/workflows/ci.yml/badge.svg)](https://github.com/ybbh/caf/actions/workflows/ci.yml)
+
 A Rust workspace implementing the **Computable Artifact Format (`.caf`)** — a
 general, domain-agnostic way to ship *data together with the computation that
 operates on it*.
@@ -64,121 +68,57 @@ caf/
 ## Quick start
 
 ```bash
-# Build the tooling
+# Build the tooling and install caf-tool
 cargo build --workspace
+cargo make install            # release binary into Cargo's bin directory
 
-# Install the release caf-tool binary into Cargo's bin directory
-cargo make install
-# Optional: select a different installation root
-cargo make install --root /path/to/install
-
-# Scaffold a new project (WIT + build config + language skeleton)
-cargo run -p caf-tool -- new my-artifact --lang rust   # rust|python|js|go|as
-
-# Pack a payload directory + interface + WASM components into a .caf artifact
-cargo run -p caf-tool -- build -c build.toml -o artifact.caf \
-    --dump-manifest artifact.manifest.json
-
-# Verify a .caf artifact (hash chain, access scopes, signature)
-cargo run -p caf-tool -- verify artifact.caf
-
-# Seal an artifact (encrypted components + payload + private manifest);
-# see doc/spec/container-format.md §8
-cargo run -p caf-tool -- keygen --recipient   # P-256 recipient keypair
-#   → add [encrypt] recipients = ["<pub hex>"] to build.toml
-cargo run -p caf-tool -- verify artifact.caf --recipient-key <secret hex>
-
-# Inspect / list / diff
-cargo run -p caf-tool -- inspect artifact.caf        # human-readable summary
-cargo run -p caf-tool -- ls artifact.caf             # payload files + components
-cargo run -p caf-tool -- diff a.caf b.caf            # per-section diff
-
-# Export all embedded contents to a ZIP
-cargo run -p caf-tool -- export artifact.caf -o artifact.zip
-# Sealed artifacts require a key; the ZIP contains decrypted contents
-cargo run -p caf-tool -- export artifact.caf -o artifact.zip --recipient-key <secret hex>
-# Uncompressed export (byte-stable ZIPs across environments)
-cargo run -p caf-tool -- export artifact.caf -o artifact.zip --compression stored
-
-# Rebuild a byte-identical .caf from the ZIP (plaintext artifacts)
-cargo run -p caf-tool -- import artifact.zip -o rebuilt.caf
-
-# List the supported container format versions (and which one build writes)
-cargo run -p caf-tool -- versions
+# Scaffold → pack → verify
+caf-tool new my-artifact --lang rust    # rust|python|js|go|as
+caf-tool build -c build.toml -o artifact.caf --dump-manifest artifact.manifest.json
+caf-tool verify artifact.caf
 
 # Execute a component function (host runtime with capability enforcement)
-cargo run -p caf-tool -- run artifact.caf --fn reproject_x --args 120,30,4326,3857
+caf-tool run artifact.caf --fn reproject_x --args 120,30,4326,3857
 ```
 
-`caf-tool` compiles the `build.toml` configuration (artifact identity, WIT
-interfaces, WASM components, capability/access declarations, and payload) into a
-single content-addressed `.caf` file. It validates the WIT interfaces with
-`wit-parser`, binds each declared capability to its world export, and (with
-`embed = true` on a component) embeds the world metadata into the module via
-`wit-component`.
+Without installing, prefix any command with `cargo run -p caf-tool --` instead.
 
-`caf-runtime` opens and verifies an artifact, instantiates its WASM components,
-exposes the read-only `payload-fs` ABI scoped to each component's declared
-access, and enforces the deny-by-default capability policy and fuel limits.
+### More caf-tool commands
 
-### ZIP export
+```bash
+caf-tool inspect artifact.caf        # human-readable summary
+caf-tool ls artifact.caf             # payload files + components
+caf-tool diff a.caf b.caf            # per-section diff
+caf-tool export artifact.caf -o artifact.zip   # export embedded contents to a ZIP
+caf-tool import artifact.zip -o rebuilt.caf    # rebuild a byte-identical .caf (plaintext)
+caf-tool keygen --recipient          # P-256 recipient keypair for sealed artifacts
+caf-tool versions                    # supported container format versions
+```
 
-`caf-tool export FILE -o OUTPUT.zip` exports the embedded contents without
-executing a component. It writes `manifest.cbor` (the exact stored bytes),
-`manifest.json`, `interfaces.cbor` plus each WIT source under
-`interfaces/<name>`, numbered `components/0000.wasm` files, and the original
-directory trees under `payloads/<name>/`, including empty files and
-directories. `export.json` records export format version 3, the original
-CAF root hash, whether the source was encrypted, the container format version,
-and component name/path mappings. Signature and keybox sections, when present,
-are retained as `signatures.cbor` and `keybox.bin`. Entries are
-deflate-compressed by default; `--compression stored` writes them uncompressed
-for byte-stable ZIPs across environments.
+Sealing (`[encrypt]` recipients), sealed verification (`--recipient-key`), the ZIP
+layout, and the reconstruction guarantees are specified in
+[container-format.md](doc/spec/en/container-format.md) §8 and
+[round-trip.md](doc/spec/en/round-trip.md).
 
-For sealed CAFs, supply `--key HEX` or `--recipient-key HEX`. The stored manifest
-is the public envelope; decrypted private metadata is exported separately as
-`private-manifest.cbor` and `private-manifest.json`. WASM and payload files in
-the ZIP are plaintext. No secret keys are included.
+## Ecosystem
 
-Payload data is read and verified in bounded chunks; ZIP64 supports large
-files. Entries have fixed timestamps and ordering for reproducible exports.
-Unsafe or conflicting paths are rejected. The ZIP is written to a temporary
-file beside the destination and published only after successful verification
-and completion. Existing outputs require `--force`; failures preserve them.
-
-WIT sources are stored concatenated inside CAF, so their original filenames
-and boundaries cannot be recovered. WASM bytes reflect the embedded component,
-including any metadata added at build time. Source code, build scripts and
-`build.toml` are exported only if they were included in the payload.
-
-### Rebuilding from a ZIP
-
-`caf-tool import ZIP -o FILE.caf` reconstructs a **byte-identical** plaintext
-artifact from its export: the preserved `manifest.cbor` is the sole ordering
-authority, every entry is verified against it, and the rebuild is published
-only after the recomputed root hash matches `export.json` and the full strict
-verification passes — for signed artifacts the original signature verifies
-against the rebuilt bytes. The deterministic rules for
-`project → .caf ⇄ .zip` are specified in
-[`doc/spec/round-trip.md`](doc/spec/round-trip.md). Sealed artifacts cannot be
-reconstructed from a plaintext export (the ciphertext is gone); the spec
-documents the two future sealed routes.
-
-For a complete, runnable end-to-end example — including a browser host runtime,
-a WASM component, and a payload in multiple open formats — see
-[`examples/gis-demo`](examples/gis-demo/README.md).
+- [CAFDReader](https://github.com/ybbh/CAFDReader) — the cross-platform reader for
+  CAFD (`.cafd`) interactive documents, a document profile built on the CAF
+  container ([CAFD 1.0.0 spec](https://github.com/ybbh/CAFDReader/blob/main/spec/en/CAFD.md)).
 
 ## Documentation
 
-- [`doc/spec/container-format.md`](doc/spec/container-format.md) — the `.caf`
+- [`doc/spec/container-format.md`](doc/spec/en/container-format.md) — the `.caf`
   container format (byte layout, manifest, components, payload, incremental
   verification, trust model, versioning).
-- [`doc/spec/caf-abi.md`](doc/spec/caf-abi.md) — the value-encoding ABI: how
+- [`doc/spec/caf-abi.md`](doc/spec/en/caf-abi.md) — the value-encoding ABI: how
   complex values cross the host↔component boundary in format v1.
-- [`doc/spec/round-trip.md`](doc/spec/round-trip.md) — deterministic
+- [`doc/spec/round-trip.md`](doc/spec/en/round-trip.md) — deterministic
   round-trip rules: reproducible build, ZIP export, byte-identical import.
-- [`doc/spec/versioning.md`](doc/spec/versioning.md) — the maintainer upgrade
+- [`doc/spec/versioning.md`](doc/spec/en/versioning.md) — the maintainer upgrade
   guide: version axes, when a bump is required, the per-version folder
   procedure.
+- [`doc/spec/terminology.md`](doc/spec/terminology.md) — the English–Chinese
+  glossary shared across CAF ecosystem documents.
 - [`examples/gis-demo/gis-profile.md`](examples/gis-demo/gis-profile.md) — an example profile
   layered on top of the generic container.

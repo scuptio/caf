@@ -1,6 +1,6 @@
 //! Guest-side helpers for CAF WASM components.
 //!
-//! This crate is the guest half of `doc/spec/caf-abi.md`: it declares the
+//! This crate is the guest half of `doc/spec/en/caf-abi.md`: it declares the
 //! host ABI (`caf.*` imports), provides the `alloc`/`dealloc` memory bridge,
 //! and packs results as `(ptr | len << 32)` values. Depend on it from a
 //! `cdylib` component built for `wasm32-unknown-unknown`; on any other target

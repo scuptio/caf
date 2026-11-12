@@ -1,9 +1,11 @@
 # GIS Profile — Spatial Capabilities (WIT)
 
+> English | [简体中文](gis-profile.zh-CN.md)
+
 Version: **0.1.0** · Status: draft
 
 The GIS profile is a **profile** of the CAF container (see
-[`container-format.md`](container-format.md)). A **Computable Spatial Artifact**
+[`../../doc/spec/en/container-format.md`](../../doc/spec/en/container-format.md)). A **Computable Spatial Artifact**
 is a `.caf` file that exposes spatial capabilities: its data, index, and
 computation all live behind a spatial WIT interface.
 

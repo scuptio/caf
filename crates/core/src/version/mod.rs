@@ -1,7 +1,7 @@
 //! Central registry of container format versions: the single place that
 //! defines what each `format_version` pins down, which versions this build
 //! supports, and how older schemas migrate to the current one
-//! (`doc/spec/container-format.md` §12).
+//! (`doc/spec/en/container-format.md` §12).
 //!
 //! Two levels live here:
 //!
@@ -23,7 +23,7 @@
 //!
 //! The maintainer procedure for cutting a new version — when a bump is
 //! required, the exact steps, migration-function rules, and testing
-//! obligations — is `doc/spec/versioning.md`.
+//! obligations — is `doc/spec/en/versioning.md`.
 
 use anyhow::{Context, Result, bail, ensure};
 

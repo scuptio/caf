@@ -1,6 +1,6 @@
 //! Payload tree construction and verification: files and directories form a
 //! Merkle tree of content hashes, with files chunked for range reads and
-//! per-chunk verification (see `doc/spec/container-format.md` §5).
+//! per-chunk verification (see `doc/spec/en/container-format.md` §5).
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};

@@ -1,5 +1,5 @@
 //! The artifact manifest: the container's self-description ("DNA"), serialized
-//! as canonical CBOR (see `doc/spec/container-format.md` §2).
+//! as canonical CBOR (see `doc/spec/en/container-format.md` §2).
 //!
 //! The manifest carries **no absolute offsets** — section layout lives in the
 //! binary directory ([`crate::layout`]) — so its content hash is independent of
@@ -196,7 +196,7 @@ pub struct ComponentRef {
     pub length: u64,
     /// SHA-256 (hex) of the component bytes.
     pub hash: String,
-    /// Capability-bound exports (see `doc/spec/caf-abi.md`).
+    /// Capability-bound exports (see `doc/spec/en/caf-abi.md`).
     pub exports: Vec<ExportEntry>,
     /// Payload paths the component may read — a hard runtime invariant.
     pub access: Vec<AccessScope>,
@@ -515,7 +515,7 @@ pub struct PrivateComponent {
     pub world: String,
     /// SHA-256 (hex) of the *plaintext* component bytes.
     pub hash: String,
-    /// Capability-bound exports (see `doc/spec/caf-abi.md`).
+    /// Capability-bound exports (see `doc/spec/en/caf-abi.md`).
     pub exports: Vec<ExportEntry>,
     /// Payload paths the component may read — a hard runtime invariant.
     pub access: Vec<AccessScope>,

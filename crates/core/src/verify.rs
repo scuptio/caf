@@ -1,6 +1,6 @@
 //! Full open-time verification of a `.caf` artifact: every section hash, the
 //! manifest hash, the domain-separated root hash, access-scope bindings, and
-//! the optional ed25519 signature (see `doc/spec/container-format.md`).
+//! the optional ed25519 signature (see `doc/spec/en/container-format.md`).
 //!
 //! Sealed artifacts (`FLAG_ENCRYPTED`) verify in two tiers: without a key,
 //! every *stored* (ciphertext) byte is hash-checked and the signature — which

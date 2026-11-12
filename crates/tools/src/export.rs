@@ -8,7 +8,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 const BLOCK: u64 = manifest::CHUNK_SIZE as u64;
 
-/// export.json schema version written by this build (`doc/spec/round-trip.md` §3).
+/// export.json schema version written by this build (`doc/spec/en/round-trip.md` §3).
 /// v3: multi-payload inventory (`payloads/<name>/`), indexed interfaces
 /// (`interfaces.cbor` + `interfaces/<name>`), signature list
 /// (`signatures.cbor`).
@@ -18,7 +18,7 @@ pub const EXPORT_FORMAT_MIN: u64 = 3;
 
 /// ZIP compression mode for `export`: `deflate` (default) or `stored`
 /// (uncompressed; removes the deflate implementation from the set of inputs
-/// the ZIP bytes depend on — see `doc/spec/round-trip.md` §3).
+/// the ZIP bytes depend on — see `doc/spec/en/round-trip.md` §3).
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum Compression {
     /// Deflate-compressed entries (default; smaller archives).
@@ -38,7 +38,7 @@ impl Compression {
 }
 
 /// Export a CAF's stored contents to the ZIP at `output`
-/// (`doc/spec/round-trip.md` §3). `force` replaces an existing output; sealed
+/// (`doc/spec/en/round-trip.md` §3). `force` replaces an existing output; sealed
 /// artifacts require `key` or `recipient`, and the ZIP then holds plaintext.
 pub fn export(
     input: &Path,

@@ -1,5 +1,5 @@
 //! Binary section layout of a `.caf` container: the fixed bootstrap header and
-//! the fixed-width section directory (see `doc/spec/container-format.md` §1).
+//! the fixed-width section directory (see `doc/spec/en/container-format.md` §1).
 //!
 //! All integers are little-endian and sections are 8-byte aligned. Because the
 //! manifest carries no offsets and directory entries are fixed-width, the whole
@@ -315,7 +315,7 @@ pub fn read_header(bytes: &[u8]) -> Result<Header> {
         bail!("unknown header flags 0x{flags:04x} (known mask 0x{KNOWN_FLAGS:04x})");
     }
     // Version admission is fail-closed at the header, before any further
-    // parsing (doc/spec/container-format.md §12).
+    // parsing (doc/spec/en/container-format.md §12).
     crate::version::spec(format_version)?;
     if header_size != HEADER_SIZE as u16 {
         bail!("unsupported header size {header_size}");

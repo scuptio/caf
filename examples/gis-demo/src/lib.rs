@@ -2,7 +2,7 @@ use serde::Serialize;
 
 // Host ABI, memory bridge (alloc/dealloc), packed results and payload-fs
 // helpers all come from the shared caf-guest crate (the reference
-// implementation of doc/spec/caf-abi.md) — no per-project copies.
+// implementation of doc/spec/en/caf-abi.md) — no per-project copies.
 use caf_guest::{list_dir, read_payload, return_str};
 
 fn error_json(msg: String) -> String {

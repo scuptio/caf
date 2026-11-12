@@ -1,5 +1,7 @@
 # CAF Container Format (`.caf`) — Specification
 
+> English | [简体中文](../zh-CN/container-format.md)
+
 Version: **0.1.0** · Status: draft
 
 A `.caf` file is a **Computable Artifact**: a single, immutable, range-readable,
@@ -548,7 +550,7 @@ A profile is a convention layered on top of this generic container. It defines:
 - payload directory conventions (which files live under the payload root),
 - optionally, an execution profile.
 
-The GIS profile is specified in [`../../examples/gis-demo/gis-profile.md`](../../examples/gis-demo/gis-profile.md). Other
+The GIS profile is specified in [`../../../examples/gis-demo/gis-profile.md`](../../../examples/gis-demo/gis-profile.md). Other
 profiles (ML inference, reporting, scientific datasets, agent tools) register
 their own namespaces without touching this document.
 
@@ -608,7 +610,7 @@ size, and no format change required.
   reject a higher major version at the header, before any further parsing.
   The supported set, per-version parameters, and schema migrations are
   maintained in `crates/core/src/version/` (one folder per version) — nowhere
-  else. The maintainer procedure is `doc/spec/versioning.md`.
+  else. The maintainer procedure is `doc/spec/en/versioning.md`.
 - Readers reject unknown header flag bits, unknown directory tags, and unknown
   manifest fields (fail-closed). Consequently any new flag, tag, or manifest
   field — e.g. a future AEAD revision — is a *major* change: it ships with a
@@ -623,4 +625,4 @@ size, and no format change required.
   versioning: adding functions is a minor capability change; changing or
   removing one requires a capability version bump.
 - Byte-identical rebuild rules (reproducible build, ZIP export, and
-  reconstruction) live in `doc/spec/round-trip.md`.
+  reconstruction) live in `doc/spec/en/round-trip.md`.

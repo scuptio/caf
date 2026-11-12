@@ -1,5 +1,5 @@
 //! Format v1 parameters: the layout, identity and crypto rules documented in
-//! `doc/spec/container-format.md`.
+//! `doc/spec/en/container-format.md`.
 use super::super::{CryptoSuite, FormatSpec};
 use crate::{identity, layout, manifest};
 

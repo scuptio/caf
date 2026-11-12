@@ -1,5 +1,5 @@
 //! `caf-tool`: command-line tool to build, verify, inspect, diff, and execute
-//! `.caf` artifacts (see `doc/spec/container-format.md`).
+//! `.caf` artifacts (see `doc/spec/en/container-format.md`).
 //!
 //! Subcommands: `build` assembles an artifact from a `build.toml`; `verify`
 //! checks the hash chain, access scopes, and signature against an optional
@@ -7,7 +7,7 @@
 //! `diff` examine artifacts; `run` executes a component function through
 //! `caf-runtime`; `new` scaffolds a fresh CAF project; `export` writes a ZIP
 //! containing all embedded contents; `import` rebuilds a byte-identical
-//! plaintext artifact from an export ZIP (see `doc/spec/round-trip.md`);
+//! plaintext artifact from an export ZIP (see `doc/spec/en/round-trip.md`);
 //! `versions` lists the supported container format versions.
 
 use anyhow::Result;

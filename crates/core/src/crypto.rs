@@ -1,5 +1,5 @@
 //! Encryption primitives for sealed `.caf` artifacts (see
-//! `doc/spec/container-format.md` §7).
+//! `doc/spec/en/container-format.md` §7).
 //!
 //! Key hierarchy:
 //!

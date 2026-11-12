@@ -1,5 +1,7 @@
 # Versioning & Upgrade Guide
 
+> English | [简体中文](../zh-CN/versioning.md)
+
 How CAF format versions are organized, when a change requires a version bump,
 and the exact procedure for cutting a new one. The machine-readable registry
 lives in `crates/core/src/version/`; this document is the human procedure

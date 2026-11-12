@@ -1,5 +1,5 @@
 //! Byte-identical reconstruction of a plaintext `.caf` from its export ZIP
-//! (see `doc/spec/round-trip.md` §4). Every byte is verified against the
+//! (see `doc/spec/en/round-trip.md` §4). Every byte is verified against the
 //! preserved `manifest.cbor` — the sole ordering authority — and the rebuild
 //! is published only after the recomputed root hash matches `export.json` and
 //! the reconstructed artifact passes strict verification.
@@ -43,7 +43,7 @@ pub fn import(input: &Path, output: &Path, force: bool) -> Result<()> {
     ensure!(
         meta["source_encrypted"] == false,
         "sealed artifacts cannot be reconstructed from plaintext exports; \
-         see doc/spec/round-trip.md §6 for the sealed routes"
+         see doc/spec/en/round-trip.md §6 for the sealed routes"
     );
 
     // manifest.cbor: the sole ordering authority (components, payload DFS).
