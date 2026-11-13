@@ -177,8 +177,20 @@ fn write_common(root: &Path, name: &str, lang: Language) -> Result<()> {
     let with_hello = matches!(lang, Language::Rust);
     let access = if with_hello { "[\"/hello.txt\"]" } else { "[]" };
     let block = build_block(name, lang);
-    render_to(root, "build.toml", &BuildToml { name, access, build_block: &block })?;
-    render_to(root, &format!("interfaces/{name}.wit"), &Wit { name, with_hello })?;
+    render_to(
+        root,
+        "build.toml",
+        &BuildToml {
+            name,
+            access,
+            build_block: &block,
+        },
+    )?;
+    render_to(
+        root,
+        &format!("interfaces/{name}.wit"),
+        &Wit { name, with_hello },
+    )?;
     render_to(root, "README.md", &Readme { name })?;
     if with_hello {
         std::fs::write(root.join("payload/hello.txt"), "Hello, CAF")?;
@@ -209,7 +221,14 @@ fn pascal_case(name: &str) -> String {
 
 fn write_python(root: &Path, name: &str) -> Result<()> {
     let class_name = pascal_case(name);
-    render_to(root, "app.py", &PythonApp { name, class_name: &class_name })
+    render_to(
+        root,
+        "app.py",
+        &PythonApp {
+            name,
+            class_name: &class_name,
+        },
+    )
 }
 
 fn write_javascript(root: &Path, name: &str) -> Result<()> {

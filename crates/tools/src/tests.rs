@@ -489,7 +489,12 @@ fn wizard_scaffolds_and_builds() -> Result<()> {
     // The scaffolded [components.build] would invoke cargo; this test supplies
     // the wasm directly, so drop the build block.
     let toml = std::fs::read_to_string(proj.join("build.toml"))?;
-    let toml = toml.split("\n[components.build]").next().unwrap().to_string() + "\n";
+    let toml = toml
+        .split("\n[components.build]")
+        .next()
+        .unwrap()
+        .to_string()
+        + "\n";
     std::fs::write(proj.join("build.toml"), toml)?;
     let mut wasm = wasm_with_bridge();
     // Rename the fixture's complex result function to the scaffold's ping.
