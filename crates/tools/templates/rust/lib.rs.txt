@@ -40,3 +40,26 @@ pub extern "C" fn ping() -> u64 {
     std::mem::forget(boxed);
     (ptr as u64) | ((len as u64) << 32)
 }
+
+// hello reads the bundled payload file /hello.txt (granted via `access` in
+// build.toml) through the payload-fs host ABI and returns its content.
+#[unsafe(no_mangle)]
+pub extern "C" fn hello() -> u64 {
+    let path = "/hello.txt";
+    let fd = unsafe { open(path.as_ptr() as u32, path.len() as u32) };
+    if fd < 0 {
+        return 0;
+    }
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { read(fd, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    unsafe { close(fd) };
+    if n < 0 {
+        return 0;
+    }
+    buf.truncate(n as usize);
+    let boxed = buf.into_boxed_slice();
+    let ptr = boxed.as_ptr() as u32;
+    let len = boxed.len() as u32;
+    std::mem::forget(boxed);
+    (ptr as u64) | ((len as u64) << 32)
+}

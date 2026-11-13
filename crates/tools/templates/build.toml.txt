@@ -13,4 +13,4 @@ name = "{{ name }}"
 world = "{{ name }}-world"
 path = "{{ name }}.wasm"
 capabilities = ["cf:{{ name }}@1"]
-access = []
+access = {{ access }}{{ build_block }}

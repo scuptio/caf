@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-tinygo build -o {{ name }}.wasm -target wasi main.go
-caf-tool build -c build.toml -o {{ name }}.caf

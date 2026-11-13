@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-# jco componentize your module, then:
-caf-tool build -c build.toml -o {{ name }}.caf

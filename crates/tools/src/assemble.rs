@@ -716,6 +716,49 @@ struct Components {
     refs: Vec<ComponentRef>,
 }
 
+/// Run a component's declared `[components.build]` step: execute `command`
+/// through the platform shell in the project directory, then copy `artifact`
+/// over `path` when the two differ.
+fn run_component_build(
+    base: &Path,
+    c: &crate::config::ComponentConfig,
+    build: &crate::config::ComponentBuild,
+) -> Result<()> {
+    eprintln!("building component '{}': {}", c.name, build.command);
+    #[cfg(windows)]
+    let mut shell = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", &build.command]);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &build.command]);
+        cmd
+    };
+    let status = shell
+        .current_dir(base)
+        .status()
+        .with_context(|| format!("run build command for component '{}'", c.name))?;
+    if !status.success() {
+        bail!(
+            "build command failed for component '{}' ({status}): {}",
+            c.name,
+            build.command
+        );
+    }
+    if let Some(artifact) = &build.artifact {
+        let (from, to) = (base.join(artifact), base.join(&c.path));
+        if from != to {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("copy build artifact {} -> {}", from.display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn build_components(
     cfg: &Config,
     base: &Path,
@@ -729,6 +772,9 @@ fn build_components(
     };
 
     for c in &cfg.components {
+        if let Some(build) = &c.build {
+            run_component_build(base, c, build)?;
+        }
         let mut blob =
             std::fs::read(base.join(&c.path)).with_context(|| format!("read wasm {}", c.path))?;
 

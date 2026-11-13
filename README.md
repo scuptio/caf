@@ -72,13 +72,14 @@ caf/
 cargo build --workspace
 cargo make install            # release binary into Cargo's bin directory
 
-# Scaffold → pack → verify
+# Scaffold → compile & pack → verify
 caf-tool new my-artifact --lang rust    # rust|python|js|go|as
+cd my-artifact
 caf-tool build -c build.toml -o artifact.caf --dump-manifest artifact.manifest.json
 caf-tool verify artifact.caf
 
 # Execute a component function (host runtime with capability enforcement)
-caf-tool run artifact.caf --fn reproject_x --args 120,30,4326,3857
+caf-tool run artifact.caf --fn ping    # the scaffold's ping() returns "pong"
 ```
 
 Without installing, prefix any command with `cargo run -p caf-tool --` instead.

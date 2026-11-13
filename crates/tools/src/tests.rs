@@ -486,6 +486,11 @@ fn wizard_scaffolds_and_builds() -> Result<()> {
 
     wizard::scaffold("demo", wizard::Language::Rust, &dir)?;
     let proj = dir.join("demo");
+    // The scaffolded [components.build] would invoke cargo; this test supplies
+    // the wasm directly, so drop the build block.
+    let toml = std::fs::read_to_string(proj.join("build.toml"))?;
+    let toml = toml.split("\n[components.build]").next().unwrap().to_string() + "\n";
+    std::fs::write(proj.join("build.toml"), toml)?;
     let mut wasm = wasm_with_bridge();
     // Rename the fixture's complex result function to the scaffold's ping.
     let name = wasm
@@ -500,11 +505,57 @@ fn wizard_scaffolds_and_builds() -> Result<()> {
 
     let report = verify::verify_bytes(&built.bytes)?;
     assert_eq!(report.name, "demo");
-    assert_eq!(built.manifest.components[0].exports.len(), 1);
+    assert_eq!(built.manifest.components[0].exports.len(), 2);
     assert_eq!(
         built.manifest.components[0].exports[0].capability,
         "cf:demo@1"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn assemble_runs_component_build_command() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("caf-tool-buildcmd-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+
+    wizard::scaffold("demo", wizard::Language::Rust, &dir)?;
+    let proj = dir.join("demo");
+    let mut wasm = wasm_with_bridge();
+    let name = wasm
+        .windows(4)
+        .position(|w| w == b"name")
+        .context("fixture name")?;
+    wasm[name..name + 4].copy_from_slice(b"ping");
+    std::fs::write(proj.join("fixture.wasm"), wasm)?;
+
+    // Keep the test hermetic: the declared build command copies the fixture.
+    let toml = std::fs::read_to_string(proj.join("build.toml"))?
+        .replace(
+            "cargo build --release --target wasm32-unknown-unknown",
+            "cp fixture.wasm compiled.wasm",
+        )
+        .replace(
+            "target/wasm32-unknown-unknown/release/demo.wasm",
+            "compiled.wasm",
+        );
+    std::fs::write(proj.join("build.toml"), toml)?;
+
+    let (cfg, base) = config::load(&proj.join("build.toml"))?;
+    assert_eq!(
+        cfg.components[0].build.as_ref().map(|b| b.command.as_str()),
+        Some("cp fixture.wasm compiled.wasm")
+    );
+    let built = assemble::assemble(&cfg, &base)?;
+    let report = verify::verify_bytes(&built.bytes)?;
+    assert_eq!(report.name, "demo");
+    // The build step copied compiled.wasm over the component path.
+    assert!(proj.join("demo.wasm").exists());
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
@@ -676,9 +727,10 @@ fn wasm_with_bridge() -> Vec<u8> {
     wasm.extend(wasm_section(3, &[0x03, 0x00, 0x01, 0x02]));
     // memory: min 1 page
     wasm.extend(wasm_section(5, &[0x01, 0x00, 0x01]));
-    // exports: name=f0, memory, alloc=f1, dealloc=f2
-    let mut exports = vec![0x05];
+    // exports: name=f0, hello=f0, query=f0, memory, alloc=f1, dealloc=f2
+    let mut exports = vec![0x06];
     exports.extend(b"\x04name\x00\x00");
+    exports.extend(b"\x05hello\x00\x00");
     exports.extend(b"\x05query\x00\x00");
     exports.extend(b"\x06memory\x02\x00");
     exports.extend(b"\x05alloc\x00\x01");
@@ -2081,19 +2133,21 @@ fn wizard_scaffolds_all_languages() -> Result<()> {
     assert!(dir.join("demo-tinygo/go.mod").exists());
     assert!(dir.join("demo-actionscript/src/Main.as").exists());
 
-    // Hyphenated names map to underscore crate names; build.sh is executable.
+    // Hyphenated names map to underscore crate names in the build block, and the
+    // Rust skeleton ships the hello demo (payload file + access grant + WIT).
     wizard::scaffold("my-rust", wizard::Language::Rust, &dir)?;
-    let build_sh = dir.join("my-rust/build.sh");
-    let text = std::fs::read_to_string(&build_sh)?;
-    assert!(text.contains("my_rust"), "{text}");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&build_sh)?.permissions().mode() & 0o111,
-            0o111
-        );
-    }
+    let text = std::fs::read_to_string(dir.join("my-rust/build.toml"))?;
+    assert!(
+        text.contains("target/wasm32-unknown-unknown/release/my_rust.wasm"),
+        "{text}"
+    );
+    assert!(text.contains("access = [\"/hello.txt\"]"), "{text}");
+    let wit = std::fs::read_to_string(dir.join("my-rust/interfaces/my-rust.wit"))?;
+    assert!(wit.contains("hello: func() -> string;"), "{wit}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("my-rust/payload/hello.txt"))?,
+        "Hello, CAF"
+    );
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }

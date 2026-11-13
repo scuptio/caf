@@ -1,6 +1,8 @@
 # {{ name }} — CAF component skeleton (Python).
-# Implement your capability and compile with componentize-py:
-#   componentize-py -d . -w {{ name }}.wit componentize app -o {{ name }}.wasm
+# Compile with componentize-py (0.25+):
+#   componentize-py -d interfaces/{{ name }}.wit -w {{ name }}-world componentize app -o {{ name }}.wasm
+# Each exported interface is implemented as a class named after it in PascalCase.
 
-def ping() -> str:
-    return "pong"
+class {{ class_name }}:
+    def ping(self) -> str:
+        return "pong"

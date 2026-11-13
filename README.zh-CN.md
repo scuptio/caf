@@ -66,13 +66,14 @@ caf/
 cargo build --workspace
 cargo make install            # 安装 release 版到 Cargo 的 bin 目录
 
-# 脚手架 → 打包 → 校验
+# 脚手架 → 编译并打包 → 校验
 caf-tool new my-artifact --lang rust    # rust|python|js|go|as
+cd my-artifact
 caf-tool build -c build.toml -o artifact.caf --dump-manifest artifact.manifest.json
 caf-tool verify artifact.caf
 
 # 执行组件函数(带能力执行的宿主运行时)
-caf-tool run artifact.caf --fn reproject_x --args 120,30,4326,3857
+caf-tool run artifact.caf --fn ping    # 骨架自带的 ping() 返回 "pong"
 ```
 
 未安装 caf-tool 时,可用 `cargo run -p caf-tool -- ...` 代替以上命令。

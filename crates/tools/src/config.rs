@@ -95,6 +95,19 @@ pub struct ComponentConfig {
     /// Embed the WIT world metadata into the module at build time.
     #[serde(default)]
     pub embed: bool,
+    /// `[components.build]`: compile the component before packing.
+    #[serde(default)]
+    pub build: Option<ComponentBuild>,
+}
+
+/// `[components.build]`: how to produce `path` before packing.
+#[derive(Deserialize)]
+pub struct ComponentBuild {
+    /// Shell command run in the project directory (`sh -c` / `cmd /C`).
+    pub command: String,
+    /// File the command produces; copied to `path` when it differs from `path`.
+    #[serde(default)]
+    pub artifact: Option<String>,
 }
 
 /// `[execution]`: the execution profile.
@@ -230,7 +243,13 @@ pub fn load(path: &Path) -> Result<(Config, PathBuf)> {
         toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
     let base = path
         .parent()
-        .map(|p| p.to_path_buf())
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
         .unwrap_or_else(|| PathBuf::from("."));
     Ok((cfg, base))
 }

@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-echo "ActionScript has no WASM toolchain; build the component in Rust/TinyGo."
-caf-tool build -c build.toml -o {{ name }}.caf
