@@ -1,0 +1,16 @@
+#!/bin/sh
+# pre-commit: run the same format gate as CI (cargo fmt --all -- --check).
+# Enable once per clone with:  cargo make setup-hooks
+# (equivalent to: git config core.hooksPath .githooks)
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH; skipping the fmt check" >&2
+    exit 0
+fi
+
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "pre-commit: cargo fmt --check failed." >&2
+    echo "  Run 'cargo fmt --all' and restage the reformatted files." >&2
+    echo "  (If rustfmt is missing: rustup component add rustfmt)" >&2
+    exit 1
+fi

@@ -13,6 +13,7 @@
 #   cargo make test       # cargo test --workspace
 #   cargo make coverage   # line coverage summary + HTML report (cargo-llvm-cov)
 #   cargo make doctor     # probe the dev toolchain; `-- install` adds the missing ones
+#   cargo make setup-hooks # enable this repo's git hooks (pre-commit: cargo fmt --check)
 
 # Don't load cargo-make's built-in core flows (build/test/CI/publish stubs):
 # every task below is defined explicitly, and skipping the core tasks keeps
@@ -140,6 +141,15 @@ description = "Clean the target/ directory"
 category = "Utility"
 command = "cargo"
 args = ["clean"]
+cwd = "${REPO_ROOT}"
+
+# One-time per clone: point git at .githooks/ so the pre-commit hook runs the
+# same cargo fmt --check gate as CI.
+[tasks.setup-hooks]
+description = "Enable this repo's git hooks (git config core.hooksPath .githooks)"
+category = "Utility"
+command = "git"
+args = ["config", "core.hooksPath", ".githooks"]
 cwd = "${REPO_ROOT}"
 
 # Pretty, grouped list of this repository's tasks. `--list-all-steps` shows
