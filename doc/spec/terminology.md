@@ -45,14 +45,7 @@ or translating documentation so both languages stay consistent.
 
 ## CAFD 阅读 / Reading
 
-| English | 中文 | 说明 / Notes |
-|---|---|---|
-| interactive document | 交互文档 | CAFD,`.cafd` |
-| thin host | 薄宿主 | 阅读器角色 |
-| reading profile | 阅读 profile | `caf:doc@1` |
-| app protocol | 应用协议 | `caf:doc-web@1` |
-| bridge | 桥接 | 宿主向书内应用提供的受控通道 |
-| bookshelf | 书架 | 文档架同义,UI 用"书架" |
-| fixture | 夹具 | 测试用最小文档 |
-| entry | 入口 | 应用清单的 HTML 入口 |
-| mount | 挂载 | 书内应用的挂载 |
+CAFD 阅读术语由 CAFDReader 仓库维护。
+CAFD reading terminology is maintained in the CAFDReader repository:
+[spec/en/terminology.md](https://github.com/scuptio/CAFDReader/blob/main/spec/en/terminology.md) ·
+[spec/zh-CN/terminology.md](https://github.com/scuptio/CAFDReader/blob/main/spec/zh-CN/terminology.md)
